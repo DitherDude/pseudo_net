@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+p256.workspace = true
 rsa.workspace = true
 rand.workspace = true
 rand_new.workspace = true

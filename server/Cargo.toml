@@ -6,6 +6,7 @@ default-run = "server"
 
 [dependencies]
 #rocksdb = "0.23.0"
+p256.workspace = true
 rsa.workspace = true
 rand.workspace = true
 rand_new.workspace = true

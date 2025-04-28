@@ -1,3 +1,4 @@
+use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret};
 use rand::rngs::OsRng;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey};
 use std::net::{TcpListener, TcpStream};
@@ -30,7 +31,17 @@ fn handle_connection(stream: TcpStream) {
     let parsed_data = parse_data(&receive_data(&stream));
     match parsed_data.indentifier {
         0 => {
-            trace!("Client new session request. Generating keypair...");
+            trace!("Client new session request. Initiating Diffie-Hellman handshake...");
+            let server_secret = EphemeralSecret::random(&mut OsRng);
+            let server_pk_bytes = EncodedPoint::from(server_secret.public_key());
+            trace!("Sending server public key...");
+            send_data(server_pk_bytes.as_bytes(), &stream);
+            trace!("Decoding client public key... (sent along with indentifier)");
+            let client_public = PublicKey::from_sec1_bytes(parsed_data.payload.as_ref())
+                .expect("Invalid client public key!");
+            let shared_secret = server_secret.diffie_hellman(&client_public);
+            trace!("Shared secret derived!");
+            //println!("{:?}", shared_secret.raw_secret_bytes());
             let (private_key, public_key) = generate_keys(2048);
             trace!("Keypair generated. Sending public key...");
             send_data(
