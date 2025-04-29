@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes-gcm-siv.workspace = true
 p256.workspace = true
 rsa.workspace = true
-rand.workspace = true
-rand_new.workspace = true
+sha3.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 utils = {path = "../utils"}

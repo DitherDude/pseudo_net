@@ -5,11 +5,10 @@ edition = "2024"
 default-run = "server"
 
 [dependencies]
-#rocksdb = "0.23.0"
+aes-gcm-siv.workspace = true
 p256.workspace = true
 rsa.workspace = true
-rand.workspace = true
-rand_new.workspace = true
+sha3.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 utils = {path = "../utils"}

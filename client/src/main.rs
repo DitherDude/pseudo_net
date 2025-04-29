@@ -1,6 +1,10 @@
-use rand::rngs::OsRng;
+use aes_gcm_siv::{
+    Aes256GcmSiv, Key, Nonce,
+    aead::{Aead, KeyInit, OsRng},
+};
 use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret};
-use rsa::{pkcs8::DecodePublicKey, Pkcs1v15Encrypt, RsaPublicKey};
+use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs8::DecodePublicKey};
+use sha3::{Digest, Sha3_256, digest::generic_array::GenericArray};
 use std::{net::TcpStream, vec};
 use tracing::{error, info, trace};
 use utils::{receive_data, send_data};
@@ -23,17 +27,23 @@ fn main() {
     send_data(&payload, &stream);
     trace!("Awaiting server public key bytes...");
     let server_public = PublicKey::from_sec1_bytes(receive_data(&stream).as_ref())
-    .expect("Invalid server public key!");
+        .expect("Invalid server public key!");
     let shared_secret = client_secret.diffie_hellman(&server_public);
     trace!("Shared secret derived!");
-    //println!("{:?}", shared_secret.raw_secret_bytes());
     trace!("Awaiting public key...");
+    let mut hasher = Sha3_256::new();
+    hasher.update(shared_secret.raw_secret_bytes());
+    let key = &hasher.finalize();
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
+    let cipher = Aes256GcmSiv::new(key);
+    let payload = receive_data(&stream);
+    let nonce = Nonce::from_slice(&payload[0..12]);
+    let cleartext = cipher.decrypt(nonce, &payload[12..]).unwrap();
     let public_key =
-        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&receive_data(&stream)))
-            .unwrap();
-    let cyphertext = public_key
-        .encrypt(&mut OsRng, Pkcs1v15Encrypt, &[0, 1, 2, 3, 4, 5])
-        .unwrap();
+        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext)).unwrap();
     trace!("Sending dummy data...");
-    send_data(&cyphertext, &stream);
+    let ciphertext = public_key
+        .encrypt(&mut OsRng, Pkcs1v15Encrypt, &[0, 7, 7, 3, 4])
+        .unwrap();
+    send_data(&ciphertext, &stream);
 }
