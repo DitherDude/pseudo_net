@@ -41,7 +41,6 @@ fn handle_connection(stream: TcpStream) {
             trace!("Client new session request. Initiating Diffie-Hellman handshake...");
             let server_secret = EphemeralSecret::random(&mut rng);
             let server_pk_bytes = EncodedPoint::from(server_secret.public_key());
-            //send_data(server_pk_bytes.as_bytes(), &stream);
             trace!("Decoding client public key... (sent along with indentifier)");
             let client_public = PublicKey::from_sec1_bytes(parsed_data.payload.as_ref())
                 .expect("Invalid client public key!");
