@@ -25,9 +25,10 @@ fn main() {
     payload.extend(client_pk_bytes.as_bytes());
     trace!("Sending client public key...");
     send_data(&payload, &stream);
-    trace!("Awaiting server public key bytes...");
-    let server_public = PublicKey::from_sec1_bytes(receive_data(&stream).as_ref())
-        .expect("Invalid server public key!");
+    trace!("Awaiting server public key (65b), nonce (12b), and encrypted RSA-2048 public key...");
+    let payload = receive_data(&stream);
+    let server_public =
+        PublicKey::from_sec1_bytes(&payload[0..65]).expect("Invalid server public key!");
     let shared_secret = client_secret.diffie_hellman(&server_public);
     trace!("Shared secret derived!");
     trace!("Awaiting public key...");
@@ -36,9 +37,8 @@ fn main() {
     let key = &hasher.finalize();
     let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
     let cipher = Aes256GcmSiv::new(key);
-    let payload = receive_data(&stream);
-    let nonce = Nonce::from_slice(&payload[0..12]);
-    let cleartext = cipher.decrypt(nonce, &payload[12..]).unwrap();
+    let nonce = Nonce::from_slice(&payload[65..77]);
+    let cleartext = cipher.decrypt(nonce, &payload[77..]).unwrap();
     let public_key =
         RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext)).unwrap();
     trace!("Sending dummy data...");

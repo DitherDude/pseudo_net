@@ -41,8 +41,7 @@ fn handle_connection(stream: TcpStream) {
             trace!("Client new session request. Initiating Diffie-Hellman handshake...");
             let server_secret = EphemeralSecret::random(&mut rng);
             let server_pk_bytes = EncodedPoint::from(server_secret.public_key());
-            trace!("Sending server public key...");
-            send_data(server_pk_bytes.as_bytes(), &stream);
+            //send_data(server_pk_bytes.as_bytes(), &stream);
             trace!("Decoding client public key... (sent along with indentifier)");
             let client_public = PublicKey::from_sec1_bytes(parsed_data.payload.as_ref())
                 .expect("Invalid client public key!");
@@ -68,8 +67,10 @@ fn handle_connection(stream: TcpStream) {
                 )
                 .unwrap();
             let mut payload = Vec::new();
+            payload.extend_from_slice(server_pk_bytes.as_bytes());
             payload.extend_from_slice(nonce);
             payload.extend_from_slice(&ciphertext);
+            trace!("Sending server public key (65b), nonce (12b), and encrypted RSA-2048 key...");
             send_data(&payload, &stream);
             trace!("Awaiting response...");
             let payload = receive_data(&stream);
