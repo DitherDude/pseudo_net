@@ -6,7 +6,7 @@ use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret};
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs8::DecodePublicKey};
 use sha3::{Digest, Sha3_256, digest::generic_array::GenericArray};
 use std::{net::TcpStream, vec};
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace};
 use utils::{receive_data, send_data};
 fn main() {
     tracing_subscriber::fmt().init();
@@ -17,6 +17,12 @@ fn main() {
     };
     info!("Connected to {}", server);
     //
+    resume_session(&stream);
+    new_session(&stream);
+}
+
+fn new_session(stream: &TcpStream) {
+    debug!("New session requested");
     trace!("Generating client secret... (Diffie-Hellman)");
     let client_secret = EphemeralSecret::random(&mut OsRng);
     let client_pk_bytes = EncodedPoint::from(client_secret.public_key());
@@ -24,9 +30,9 @@ fn main() {
     let mut payload = vec![0];
     payload.extend(client_pk_bytes.as_bytes());
     trace!("Sending client public key...");
-    send_data(&payload, &stream);
+    send_data(&payload, stream);
     trace!("Awaiting server public key (65b), nonce (12b), and encrypted RSA-2048 public key...");
-    let payload = receive_data(&stream);
+    let payload = receive_data(stream);
     let server_public =
         PublicKey::from_sec1_bytes(&payload[0..65]).expect("Invalid server public key!");
     let shared_secret = client_secret.diffie_hellman(&server_public);
@@ -45,5 +51,20 @@ fn main() {
     let ciphertext = public_key
         .encrypt(&mut OsRng, Pkcs1v15Encrypt, &[0, 7, 7, 3, 4])
         .unwrap();
-    send_data(&ciphertext, &stream);
+    send_data(&ciphertext, stream);
+}
+
+fn resume_session(stream: &TcpStream) {
+    trace!("Resume session requested. Sending session ID...");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[1u8]);
+    //payload.extend_from_slice();
+    send_data(&payload, stream);
+    trace!("Awaiting sum from server...");
+    let rawdata = receive_data(stream);
+    let num1 = u32::from_le_bytes(rawdata[..4].try_into().unwrap());
+    let num2 = u32::from_le_bytes(rawdata[4..8].try_into().unwrap());
+    let sum = num1 & num2;
+    trace!("returning XOR result... ");
+    send_data(&sum.to_le_bytes(), stream);
 }

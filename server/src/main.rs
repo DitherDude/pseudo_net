@@ -4,14 +4,17 @@ use aes_gcm_siv::{
 };
 use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret};
 use rsa::{
-    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey, rand_core::RngCore,
+    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+    pkcs8::EncodePublicKey,
+    rand_core::{self, RngCore},
 };
 use sha3::{Digest, Sha3_256, digest::generic_array::GenericArray};
 use std::net::{TcpListener, TcpStream};
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use utils::{receive_data, send_data};
 fn main() {
     tracing_subscriber::fmt().init();
+
     let listener = TcpListener::bind("127.0.0.1:15496").unwrap();
     info!("Server listening on 127.0.0.1:15496");
     for stream in listener.incoming() {
@@ -22,8 +25,8 @@ fn main() {
                     stream.peer_addr().unwrap().ip(),
                     stream.peer_addr().unwrap().port()
                 );
-                std::thread::spawn(move || {
-                    handle_connection(stream);
+                async_std::task::spawn(async {
+                    handle_connection(stream).await;
                 });
             }
             Err(e) => {
@@ -33,7 +36,7 @@ fn main() {
     }
 }
 
-fn handle_connection(stream: TcpStream) {
+async fn handle_connection(stream: TcpStream) {
     let mut rng = OsRng;
     let parsed_data = parse_data(&receive_data(&stream));
     match parsed_data.indentifier {
@@ -83,6 +86,19 @@ fn handle_connection(stream: TcpStream) {
                 "Client resume session request with ID {:?}.",
                 parsed_data.payload
             );
+            let num1 = rand_core::RngCore::next_u32(&mut OsRng);
+            let num2 = rand_core::RngCore::next_u32(&mut OsRng);
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&num1.to_le_bytes());
+            payload.extend_from_slice(&num2.to_le_bytes());
+            send_data(&payload, &stream);
+            if receive_data(&stream) == (num1 ^ num2).to_le_bytes().to_vec() {
+                println!("Session resumed!");
+            } else {
+                warn!("Verification failure. Dropped client.");
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                return;
+            }
         }
         _ => {}
     }
