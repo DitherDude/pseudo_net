@@ -12,6 +12,7 @@ rsa.workspace = true
 sha3.workspace = true
 sql.workspace = true
 sqlx.workspace = true
+srp6.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 utils = {path = "../utils"}

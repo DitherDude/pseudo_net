@@ -4,18 +4,35 @@ use aes_gcm_siv::{
 };
 use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret};
 use rsa::{
-    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+    RsaPrivateKey, RsaPublicKey,
     pkcs8::EncodePublicKey,
     rand_core::{self, RngCore},
 };
 use sha3::{Digest, Sha3_256, digest::generic_array::GenericArray};
+use sqlx::mysql::MySqlPool;
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use tracing::{error, info, trace, warn};
-use utils::{receive_data, send_data};
-fn main() {
-    tracing_subscriber::fmt().init();
+use utils::{block_decrypt, receive_data, send_data};
 
+#[async_std::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+    trace!("Looking for config file...");
+    if std::fs::metadata("config").is_err() {
+        error!("Config file not found!");
+        std::process::exit(1);
+    }
+    trace!("Testing MYSQL connection...");
+    match MySqlPool::connect(&retreive_config("PATH")).await {
+        Ok(_) => {}
+        Err(e) => {
+            error!("Failed to connect to database: {}", e);
+            std::process::exit(1);
+        }
+    };
     let listener = TcpListener::bind("127.0.0.1:15496").unwrap();
+
     info!("Server listening on 127.0.0.1:15496");
     for stream in listener.incoming() {
         match stream {
@@ -59,27 +76,98 @@ async fn handle_connection(stream: TcpStream) {
             let mut raw_nonce = [0u8; 12];
             rng.try_fill_bytes(&mut raw_nonce).unwrap();
             let nonce = Nonce::from_slice(&raw_nonce);
-            let ciphertext = cipher
-                .encrypt(
-                    nonce,
-                    public_key
-                        .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
-                        .unwrap()
-                        .as_ref(),
-                )
-                .unwrap();
+            let mut cleartext = Vec::new();
+            let mut raw_nonce = [0u8; 12];
+            rng.try_fill_bytes(&mut raw_nonce).unwrap();
+            cleartext.extend_from_slice(&raw_nonce);
+            cleartext.extend_from_slice(
+                public_key
+                    .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+                    .unwrap()
+                    .as_ref(),
+            );
+            let ciphertext = cipher.encrypt(nonce, cleartext.as_ref()).unwrap();
             let mut payload = Vec::new();
             payload.extend_from_slice(server_pk_bytes.as_bytes());
             payload.extend_from_slice(nonce);
             payload.extend_from_slice(&ciphertext);
             trace!("Sending server public key (65b), nonce (12b), and encrypted RSA-2048 key...");
             send_data(&payload, &stream);
-            trace!("Awaiting response...");
+            trace!("Awaiting nextnonce (12b), salt (512b), verifier (512b), and username (?b)...");
             let payload = receive_data(&stream);
-            println!(
-                "Returned data: {:?}",
-                private_key.decrypt(Pkcs1v15Encrypt, &payload).unwrap()
+            let response = match block_decrypt(&private_key, &payload) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("Failed to decrypt data: {}", e);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    return;
+                }
+            };
+            let nextnonce = &response[0..12];
+            let salt = &response[12..524];
+            let verifier = &response[524..1036];
+            let username = &response[1036..];
+            println!("{}", username.len());
+            let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
+            trace!("Generating userid...");
+            let userid: [u8; 64] = loop {
+                let mut userid = [0u8; 64];
+                rng.try_fill_bytes(&mut userid).unwrap();
+                let result =
+                    match sqlx::query!(r#"SELECT userid FROM users WHERE userid = ?"#, &userid[..])
+                        .fetch_optional(&pool)
+                        .await
+                    {
+                        Ok(data) => data,
+                        Err(e) => {
+                            warn!("Failed to query database: {}", e);
+                            stream.shutdown(std::net::Shutdown::Both).unwrap();
+                            return;
+                        }
+                    };
+                if result.is_none() {
+                    break userid;
+                }
+            };
+            trace!("Checking if user exists...");
+            if match sqlx::query!(r#"SELECT userid FROM users WHERE userid = ?"#, &userid[..])
+                .fetch_optional(&pool)
+                .await
+            {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("Failed to query database: {}", e);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    return;
+                }
+            }
+            .is_some()
+            {
+                warn!("Attempting to register a user that already exists.");
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                return;
+            }
+            match sqlx::query!(
+                r#"
+                INSERT INTO users ( userid, username, salt, verifier, nonce )
+                VALUES ( ?, ?, ?, ?, ? )
+                "#,
+                &userid[..],
+                username,
+                salt,
+                verifier,
+                nextnonce
             )
+            .execute(&pool)
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to insert user: {}", e);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    return;
+                }
+            };
         }
         1 => {
             trace!(
@@ -128,4 +216,22 @@ fn parse_data(data: &[u8]) -> DataParser {
         indentifier: data[0],
         payload: data[1..].to_vec(),
     }
+}
+
+fn retreive_config(path: &str) -> String {
+    if std::fs::metadata("config").is_err() {
+        error!("Config file not found!");
+        std::process::exit(1);
+    }
+    let mut file = std::fs::File::open("config").unwrap();
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).unwrap();
+    let mut lookup = path.to_string();
+    lookup.push(':');
+    for line in contents.lines() {
+        if line.starts_with(&lookup) {
+            return line.replace(&lookup, "").trim().to_string();
+        }
+    }
+    String::new()
 }

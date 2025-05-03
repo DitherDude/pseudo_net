@@ -1,3 +1,5 @@
+use aes_gcm_siv::aead::OsRng;
+use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};
 use std::{
     io::{Read, Write},
     net::TcpStream,
@@ -66,4 +68,22 @@ pub fn send_data(payload: &[u8], mut stream: &TcpStream) {
         }
     }
     trace!("Finished sending data.");
+}
+
+pub fn block_encrypt(key: &RsaPublicKey, data: &[u8]) -> Result<Vec<u8>, rsa::Error> {
+    let chunk_by = key.size() - 11;
+    let mut payload = Vec::new();
+    for chunk in data.chunks(chunk_by) {
+        payload.extend(key.encrypt(&mut OsRng, Pkcs1v15Encrypt, chunk)?);
+    }
+    Ok(payload)
+}
+
+pub fn block_decrypt(key: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>, rsa::Error> {
+    let chunk_by = key.size();
+    let mut payload = Vec::new();
+    for chunk in data.chunks(chunk_by) {
+        payload.extend(key.decrypt(Pkcs1v15Encrypt, chunk)?);
+    }
+    Ok(payload)
 }

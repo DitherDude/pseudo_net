@@ -2,12 +2,18 @@ use aes_gcm_siv::{
     Aes256GcmSiv, Key, Nonce,
     aead::{Aead, KeyInit, OsRng},
 };
+use console::Term;
 use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret};
-use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs8::DecodePublicKey};
+use rsa::{RsaPublicKey, pkcs8::DecodePublicKey, rand_core::RngCore};
 use sha3::{Digest, Sha3_256, digest::generic_array::GenericArray};
-use std::{net::TcpStream, vec};
+use srp6::prelude::*;
+use std::{
+    io::{self, BufRead, Write},
+    net::TcpStream,
+    vec,
+};
 use tracing::{debug, error, info, trace};
-use utils::{receive_data, send_data};
+use utils::{block_encrypt, receive_data, send_data};
 fn main() {
     tracing_subscriber::fmt().init();
     let server = "127.0.0.1:15496";
@@ -17,11 +23,12 @@ fn main() {
     };
     info!("Connected to {}", server);
     //
-    resume_session(&stream);
     new_session(&stream);
+    //resume_session(&stream);
 }
 
 fn new_session(stream: &TcpStream) {
+    let mut rng = OsRng;
     debug!("New session requested");
     trace!("Generating client secret... (Diffie-Hellman)");
     let client_secret = EphemeralSecret::random(&mut OsRng);
@@ -31,6 +38,8 @@ fn new_session(stream: &TcpStream) {
     payload.extend(client_pk_bytes.as_bytes());
     trace!("Sending client public key...");
     send_data(&payload, stream);
+    trace!("Getting username, salt, and verifier...");
+    let (username, salt, verifier) = register();
     trace!("Awaiting server public key (65b), nonce (12b), and encrypted RSA-2048 public key...");
     let payload = receive_data(stream);
     let server_public =
@@ -46,11 +55,16 @@ fn new_session(stream: &TcpStream) {
     let nonce = Nonce::from_slice(&payload[65..77]);
     let cleartext = cipher.decrypt(nonce, &payload[77..]).unwrap();
     let public_key =
-        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext)).unwrap();
-    trace!("Sending dummy data...");
-    let ciphertext = public_key
-        .encrypt(&mut OsRng, Pkcs1v15Encrypt, &[0, 7, 7, 3, 4])
-        .unwrap();
+        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext[12..])).unwrap();
+    trace!("Sending nextnonce (12b), salt (512b), verifier (512b), and username (?b)...");
+    let mut nextnonce = [0; 12];
+    rng.try_fill_bytes(&mut nextnonce).unwrap();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&nextnonce);
+    payload.extend_from_slice(&salt);
+    payload.extend_from_slice(&verifier);
+    payload.extend_from_slice(&username);
+    let ciphertext = block_encrypt(&public_key, &payload).unwrap();
     send_data(&ciphertext, stream);
 }
 
@@ -67,4 +81,59 @@ fn resume_session(stream: &TcpStream) {
     let sum = num1 & num2;
     trace!("returning XOR result... ");
     send_data(&sum.to_le_bytes(), stream);
+}
+
+fn register() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let username = Username::from(request("Username: ", false));
+    let password = ClearTextPassword::from(request("Password: ", true));
+    let (salt, verifier) = Srp6_4096::default().generate_new_user_secrets(&username, &password);
+    (
+        username.as_bytes().to_vec(),
+        salt.to_vec(),
+        verifier.to_vec(),
+    )
+}
+
+fn request(prompt: &str, password: bool) -> String {
+    let stdin = io::stdin();
+    if !password {
+        print!("{}", prompt);
+        io::stdout().flush().unwrap();
+        let mut username = String::new();
+        stdin.lock().read_line(&mut username).unwrap();
+        let username = username.trim().to_string();
+        io::stdout().flush().unwrap();
+        return username;
+    }
+    let mut password = String::new();
+    print!("\x1B[2K\r\x1B[31m{}\x1B[0m", prompt);
+    std::io::stdout().flush().unwrap();
+    let term = Term::stdout();
+    loop {
+        match term.read_key().unwrap() {
+            console::Key::Char(c) => {
+                password.push(c);
+            }
+            console::Key::Backspace => {
+                if password.is_empty() {
+                } else {
+                    password.pop();
+                    if password.is_empty() {
+                        print!("\x1B[2K\r\x1B[31m{}\x1B[0m", prompt);
+                        std::io::stdout().flush().unwrap();
+                    }
+                }
+                continue;
+            }
+            console::Key::Enter => {
+                break;
+            }
+            _ => {}
+        }
+        print!("\x1B[2K\r\x1B[33m{}\x1B[0m", prompt);
+        std::io::stdout().flush().unwrap();
+    }
+    println!("\x1B[2K\r\x1B[32m{}\x1B[0m", prompt);
+    let password = password.trim().to_string();
+    password
 }
