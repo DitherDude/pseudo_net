@@ -20,12 +20,73 @@ async fn main() {
     tracing_subscriber::fmt().init();
     trace!("Looking for config file...");
     if std::fs::metadata("config").is_err() {
-        error!("Config file not found!");
+        error!("Config file not found! Please see docs on how to create a config file.");
         std::process::exit(1);
     }
     trace!("Testing MYSQL connection...");
     match MySqlPool::connect(&retreive_config("PATH")).await {
-        Ok(_) => {}
+        Ok(pool) => {
+            trace!("Checking users table schema...");
+            match sqlx::query!(
+                r#"
+                SELECT 
+                COUNT(*) as count
+                FROM 
+                INFORMATION_SCHEMA.COLUMNS
+                WHERE 
+                TABLE_NAME = 'users'
+                AND (COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_KEY) IN (
+                    ('userid', 'varbinary', 64, 'NO', 'PRI'),
+                    ('username', 'varbinary', 255, 'NO', 'UNI'),
+                    ('salt', 'varbinary', 512, 'NO', ''),
+                    ('verifier', 'varbinary', 512, 'NO', ''),
+                    ('nonce', 'varbinary', 255, 'YES', ''),
+                    ('user_pk', 'varbinary', 2048, 'YES', ''),
+                    ('magic', 'varbinary', 255, 'YES', '')
+                );
+                "#
+            )
+            .fetch_optional(&pool)
+            .await
+            {
+                Ok(Some(e)) => {
+                    if e.count == 7 {
+                        trace!("Users table schema is valid.");
+                    } else {
+                        warn!("Missing users table. Will attempt to create it.");
+                        match sqlx::query!(
+                            r#"
+                            CREATE TABLE users (
+                                userid varbinary(64) NOT NULL PRIMARY KEY,
+                                username varbinary(255) NOT NULL UNIQUE,
+                                salt varbinary(512) NOT NULL,
+                                verifier varbinary(512) NOT NULL,
+                                nonce varbinary(255),
+                                user_pk varbinary(2048),
+                                magic varbinary(255)
+                            );
+                            "#
+                        )
+                        .execute(&pool)
+                        .await
+                        {
+                            Ok(_) => {
+                                trace!("Created users table.");
+                            }
+                            Err(e) => {
+                                error!("Failed to create users table: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!("Failed to check users table schema: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         Err(e) => {
             error!("Failed to connect to database: {}", e);
             std::process::exit(1);
@@ -62,8 +123,14 @@ async fn handle_connection(stream: TcpStream) {
             let server_secret = EphemeralSecret::random(&mut rng);
             let server_pk_bytes = EncodedPoint::from(server_secret.public_key());
             trace!("Decoding client public key... (sent along with indentifier)");
-            let client_public = PublicKey::from_sec1_bytes(parsed_data.payload.as_ref())
-                .expect("Invalid client public key!");
+            let client_public = match PublicKey::from_sec1_bytes(parsed_data.payload.as_ref()) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("Failed to decode client public key: {}", e);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    return;
+                }
+            };
             let shared_secret = server_secret.diffie_hellman(&client_public);
             trace!("Shared secret derived!");
             let (private_key, public_key) = generate_keys(2048);
