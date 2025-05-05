@@ -10,18 +10,19 @@ use rsa::{
 };
 use sha3::{Digest, Sha3_256, digest::generic_array::GenericArray};
 use sqlx::mysql::MySqlPool;
+use std::cmp::Ordering::{Equal, Greater, Less};
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
+use std::process::exit;
 use tracing::{error, info, trace, warn};
 use utils::{block_decrypt, receive_data, send_data};
-
 #[async_std::main]
 async fn main() {
     tracing_subscriber::fmt().init();
     trace!("Looking for config file...");
     if std::fs::metadata("config").is_err() {
         error!("Config file not found! Please see docs on how to create a config file.");
-        std::process::exit(1);
+        exit(1);
     }
     trace!("Testing MYSQL connection...");
     match MySqlPool::connect(&retreive_config("PATH")).await {
@@ -75,7 +76,7 @@ async fn main() {
                             }
                             Err(e) => {
                                 error!("Failed to create users table: {}", e);
-                                std::process::exit(1);
+                                exit(1);
                             }
                         }
                     }
@@ -83,18 +84,18 @@ async fn main() {
                 Ok(None) => {}
                 Err(e) => {
                     error!("Failed to check users table schema: {}", e);
-                    std::process::exit(1);
+                    exit(1);
                 }
             }
         }
         Err(e) => {
             error!("Failed to connect to database: {}", e);
-            std::process::exit(1);
+            exit(1);
         }
     };
-    let listener = TcpListener::bind("127.0.0.1:15496").unwrap();
-
-    info!("Server listening on 127.0.0.1:15496");
+    let port = retreive_config("PORT").parse::<u16>().unwrap_or(15496);
+    let listener = TcpListener::bind("127.0.0.1:".to_owned() + &port.to_string()).unwrap();
+    info!("Server listening on 127.0.0.1:{}", port);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -127,114 +128,201 @@ async fn handle_connection(stream: TcpStream) {
                 Ok(data) => data,
                 Err(e) => {
                     warn!("Failed to decode client public key: {}", e);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                     return;
                 }
             };
             let shared_secret = server_secret.diffie_hellman(&client_public);
             trace!("Shared secret derived!");
-            let (private_key, public_key) = generate_keys(2048);
-            trace!("Keypair generated. Sending encrypted public key...");
+            let (private_key, public_key) = generate_keys();
+            trace!("Keypair generated. Encrypting public key...");
             let mut hasher = Sha3_256::new();
             hasher.update(shared_secret.raw_secret_bytes());
             let key = &hasher.finalize();
             let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
             let cipher = Aes256GcmSiv::new(key);
-            let mut raw_nonce = [0u8; 12];
-            rng.try_fill_bytes(&mut raw_nonce).unwrap();
-            let nonce = Nonce::from_slice(&raw_nonce);
+            let mut encryptnonce = [0u8; 12];
+            rng.try_fill_bytes(&mut encryptnonce).unwrap();
+            let encryptnonce = Nonce::from_slice(&encryptnonce);
             let mut cleartext = Vec::new();
-            let mut raw_nonce = [0u8; 12];
-            rng.try_fill_bytes(&mut raw_nonce).unwrap();
-            cleartext.extend_from_slice(&raw_nonce);
+            let mut decryptnonce = [0u8; 12];
+            rng.try_fill_bytes(&mut decryptnonce).unwrap();
+            cleartext.extend_from_slice(&decryptnonce);
             cleartext.extend_from_slice(
                 public_key
                     .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
                     .unwrap()
                     .as_ref(),
             );
-            let ciphertext = cipher.encrypt(nonce, cleartext.as_ref()).unwrap();
+            let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
             let mut payload = Vec::new();
             payload.extend_from_slice(server_pk_bytes.as_bytes());
-            payload.extend_from_slice(nonce);
+            payload.extend_from_slice(encryptnonce);
             payload.extend_from_slice(&ciphertext);
-            trace!("Sending server public key (65b), nonce (12b), and encrypted RSA-2048 key...");
+            trace!(
+                "Sending server public key (65b), encryptnonce (12b), and encrypted RSA-2048 key..."
+            );
             send_data(&payload, &stream);
-            trace!("Awaiting nextnonce (12b), salt (512b), verifier (512b), and username (?b)...");
+            trace!(
+                "Awaiting encryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
+            );
             let payload = receive_data(&stream);
-            let response = match block_decrypt(&private_key, &payload) {
+            let ciphertext = match block_decrypt(&private_key, &payload) {
                 Ok(data) => data,
                 Err(e) => {
-                    warn!("Failed to decrypt data: {}", e);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    warn!(
+                        "Client sent invalid bytes. Sending errorcode and dropping connection. {}",
+                        e
+                    );
+                    send_data(&400_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                     return;
                 }
             };
-            let nextnonce = &response[0..12];
-            let salt = &response[12..524];
-            let verifier = &response[524..1036];
-            let username = &response[1036..];
-            println!("{}", username.len());
+            let cleartext = match cipher.decrypt(Nonce::from_slice(&decryptnonce), &ciphertext[..])
+            {
+                Ok(data) => {
+                    if data.len() <= 12 {
+                        warn!(
+                            "Client data is too short (username must be at least 1b). Sending errorcode and dropping connection."
+                        );
+                        send_data(&401_i32.to_le_bytes(), &stream);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    } else if data.len() > 267 {
+                        warn!(
+                            "Client data is too long (username must be less than 255b). Sending errorcode and dropping connection."
+                        );
+                        send_data(&402_i32.to_le_bytes(), &stream);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    } else {
+                        data
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to decrypt data. Sending errorcode and dropping connection. {}",
+                        e
+                    );
+                    send_data(&400_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            };
             let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
-            trace!("Generating userid...");
-            let userid: [u8; 64] = loop {
-                let mut userid = [0u8; 64];
-                rng.try_fill_bytes(&mut userid).unwrap();
-                let result =
-                    match sqlx::query!(r#"SELECT userid FROM users WHERE userid = ?"#, &userid[..])
-                        .fetch_optional(&pool)
-                        .await
-                    {
-                        Ok(data) => data,
-                        Err(e) => {
-                            warn!("Failed to query database: {}", e);
-                            stream.shutdown(std::net::Shutdown::Both).unwrap();
-                            return;
-                        }
-                    };
-                if result.is_none() {
-                    break userid;
-                }
-            };
-            trace!("Checking if user exists...");
-            if match sqlx::query!(r#"SELECT userid FROM users WHERE userid = ?"#, &userid[..])
-                .fetch_optional(&pool)
-                .await
-            {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!("Failed to query database: {}", e);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
-                    return;
-                }
-            }
-            .is_some()
-            {
-                warn!("Attempting to register a user that already exists.");
-                stream.shutdown(std::net::Shutdown::Both).unwrap();
-                return;
-            }
-            match sqlx::query!(
-                r#"
-                INSERT INTO users ( userid, username, salt, verifier, nonce )
-                VALUES ( ?, ?, ?, ?, ? )
-                "#,
-                &userid[..],
-                username,
-                salt,
-                verifier,
-                nextnonce
+            trace!(
+                "Checking if requested user exists, and returning result to client (1 for yes, 2 for no)"
+            );
+            let username = &cleartext[12..];
+            let userexists = match sqlx::query!(
+                r#"SELECT COUNT(*) as count FROM users WHERE username = ?"#,
+                &username
             )
-            .execute(&pool)
+            .fetch_optional(&pool)
             .await
             {
-                Ok(_) => {}
+                Ok(Some(data)) => data.count,
+                Ok(None) => {
+                    warn!(
+                        "Unexpected response from database. Sending errorcode and dropping connection."
+                    );
+                    send_data(&500_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
                 Err(e) => {
-                    warn!("Failed to insert user: {}", e);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    error!(
+                        "Failed to query database. Sending errorcode and dropping connection. {}",
+                        e
+                    );
+                    send_data(&500_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                     return;
                 }
             };
+            if userexists > 2 {
+                warn!(
+                    "Invalid count of occurances for user {:?}! Sending errorcode and dropping connection.",
+                    &cleartext[12..]
+                );
+                send_data(&500_i32.to_le_bytes(), &stream);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            let encryptnonce = Nonce::from_slice(&cleartext[..12]);
+            rng.try_fill_bytes(&mut decryptnonce).unwrap();
+            let mut cleartext = Vec::new();
+            cleartext.extend_from_slice(&decryptnonce);
+            cleartext.extend_from_slice(&userexists.to_le_bytes());
+            let payload = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+            send_data(&payload, &stream);
+            if userexists == 1 {
+                //login(&cleartext[12..])
+            } else {
+                let response = receive_data(&stream);
+                let ciphertext = match block_decrypt(&private_key, &response) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!(
+                            "Client sent invalid bytes. Sending errorcode and dropping connection. {}",
+                            e
+                        );
+                        send_data(&400_i32.to_le_bytes(), &stream);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                };
+                let payload = match cipher
+                    .decrypt(Nonce::from_slice(&decryptnonce), &ciphertext[..])
+                {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!(
+                            "Failed to decrypt data. Sending errorcode and dropping connection. {}",
+                            e
+                        );
+                        send_data(&400_i32.to_le_bytes(), &stream);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                };
+                match payload.len().cmp(&1036) {
+                    Less => {
+                        warn!(
+                            "Client data is too short (expecting 1036b). Sending errorcode and dropping connection. {}",
+                            payload.len()
+                        );
+                        send_data(&401_i32.to_le_bytes(), &stream);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    Greater => {
+                        warn!(
+                            "Client data is too long (expecting 1036b). Sending errorcode and dropping connection."
+                        );
+                        send_data(&402_i32.to_le_bytes(), &stream);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    Equal => {
+                        let encryptnonce = &payload[..12];
+                        let salt = &payload[12..524];
+                        let verifier = &payload[524..1036];
+                        rng.try_fill_bytes(&mut decryptnonce).unwrap();
+                        let mut plaintext = Vec::new();
+                        plaintext.extend_from_slice(&decryptnonce);
+                        plaintext.extend_from_slice(
+                            &srp6_register(username, pool, &stream, salt, verifier, &decryptnonce)
+                                .await,
+                        );
+                        let data = cipher
+                            .encrypt(Nonce::from_slice(encryptnonce), plaintext.as_ref())
+                            .unwrap();
+                        send_data(&data, &stream);
+                    }
+                }
+            }
         }
         1 => {
             trace!(
@@ -250,8 +338,9 @@ async fn handle_connection(stream: TcpStream) {
             if receive_data(&stream) == (num1 ^ num2).to_le_bytes().to_vec() {
                 println!("Session resumed!");
             } else {
-                warn!("Verification failure. Dropped client.");
-                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                warn!("Verification failure. Sending vague errorcode, and dropping client.");
+                send_data(&501_i32.to_le_bytes(), &stream);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             }
         }
@@ -264,7 +353,8 @@ async fn handle_connection(stream: TcpStream) {
     );
 }
 
-fn generate_keys(bits: usize) -> (RsaPrivateKey, RsaPublicKey) {
+fn generate_keys() -> (RsaPrivateKey, RsaPublicKey) {
+    let bits = retreive_config("BITS").parse::<usize>().unwrap_or(2048);
     trace!("Generating keys...");
     let mut rng = OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, bits).unwrap();
@@ -288,7 +378,7 @@ fn parse_data(data: &[u8]) -> DataParser {
 fn retreive_config(path: &str) -> String {
     if std::fs::metadata("config").is_err() {
         error!("Config file not found!");
-        std::process::exit(1);
+        exit(1);
     }
     let mut file = std::fs::File::open("config").unwrap();
     let mut contents = String::new();
@@ -301,4 +391,89 @@ fn retreive_config(path: &str) -> String {
         }
     }
     String::new()
+}
+
+async fn srp6_register(
+    username: &[u8],
+    pool: MySqlPool,
+    stream: &TcpStream,
+    salt: &[u8],
+    verifier: &[u8],
+    decryptnonce: &[u8],
+) -> Vec<u8> {
+    let mut rng = OsRng;
+    trace!("Generating userid...");
+    let userid: [u8; 64] = loop {
+        let mut userid = [0u8; 64];
+        rng.try_fill_bytes(&mut userid).unwrap();
+        let result = match sqlx::query!(r#"SELECT userid FROM users WHERE userid = ?"#, &userid[..])
+            .fetch_optional(&pool)
+            .await
+        {
+            Ok(data) => data,
+            Err(e) => {
+                error!(
+                    "Failed to query database. Sending errorcode and dropping client. {}",
+                    e
+                );
+                send_data(&500_i32.to_le_bytes(), stream);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return Vec::new();
+            }
+        };
+        if result.is_none() {
+            break userid;
+        }
+    };
+    trace!("Checking if user exists...");
+    if match sqlx::query!(r#"SELECT userid FROM users WHERE username = ?"#, &username)
+        .fetch_optional(&pool)
+        .await
+    {
+        Ok(data) => data,
+        Err(e) => {
+            error!(
+                "Failed to query database. Sending errorcode and dropping client. {}",
+                e
+            );
+            send_data(&500_i32.to_le_bytes(), stream);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Vec::new();
+        }
+    }
+    .is_some()
+    {
+        warn!(
+            "Attempting to register a user that already exists. Sending vague errorcode, and dropping client."
+        );
+        send_data(&400_i32.to_le_bytes(), stream);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Vec::new();
+    }
+    match sqlx::query!(
+        r#"
+        INSERT INTO users ( userid, username, salt, verifier, nonce )
+        VALUES ( ?, ?, ?, ?, ? )
+        "#,
+        &userid[..],
+        username,
+        salt,
+        verifier,
+        decryptnonce
+    )
+    .execute(&pool)
+    .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                "Failed to insert user. Sending errorcode and dropping client. {}",
+                e
+            );
+            send_data(&500_i32.to_le_bytes(), stream);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Vec::new();
+        }
+    };
+    userid.to_vec()
 }
