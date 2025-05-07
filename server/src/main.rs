@@ -118,138 +118,135 @@ async fn main() {
 async fn handle_connection(stream: TcpStream) {
     let mut rng = OsRng;
     let parsed_data = parse_data(&receive_data(&stream));
-    match parsed_data.indentifier {
-        0 => {
-            trace!("Client new session request. Initiating Diffie-Hellman handshake...");
-            let server_secret = EphemeralSecret::random(&mut rng);
-            let server_pk_bytes = EncodedPoint::from(server_secret.public_key());
-            trace!("Decoding client public key... (sent along with indentifier)");
-            let client_public = match PublicKey::from_sec1_bytes(parsed_data.payload.as_ref()) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!("Failed to decode client public key: {}", e);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    return;
-                }
-            };
-            let shared_secret = server_secret.diffie_hellman(&client_public);
-            trace!("Shared secret derived!");
-            let (private_key, public_key) = generate_keys();
-            trace!("Keypair generated. Encrypting public key...");
-            let mut hasher = Sha3_256::new();
-            hasher.update(shared_secret.raw_secret_bytes());
-            let key = &hasher.finalize();
-            let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
-            let cipher = Aes256GcmSiv::new(key);
-            let mut encryptnonce = [0u8; 12];
-            rng.try_fill_bytes(&mut encryptnonce).unwrap();
-            let encryptnonce = Nonce::from_slice(&encryptnonce);
-            let mut cleartext = Vec::new();
-            let mut decryptnonce = [0u8; 12];
-            rng.try_fill_bytes(&mut decryptnonce).unwrap();
-            cleartext.extend_from_slice(&decryptnonce);
-            cleartext.extend_from_slice(
-                public_key
-                    .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
-                    .unwrap()
-                    .as_ref(),
+    if parsed_data.indentifier == 0 {
+        trace!("Client new session request. Initiating Diffie-Hellman handshake...");
+    } else if parsed_data.indentifier == 1 {
+        trace!("Client resume session request. Initiating Diffie-Hellman handshake...");
+    }
+    let server_secret = EphemeralSecret::random(&mut rng);
+    let server_pk_bytes = EncodedPoint::from(server_secret.public_key());
+    trace!("Decoding client public key... (sent along with indentifier)");
+    let client_public = match PublicKey::from_sec1_bytes(parsed_data.payload.as_ref()) {
+        Ok(data) => data,
+        Err(e) => {
+            warn!("Failed to decode client public key: {}", e);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    };
+    let shared_secret = server_secret.diffie_hellman(&client_public);
+    trace!("Shared secret derived!");
+    let (private_key, public_key) = generate_keys();
+    trace!("Keypair generated. Encrypting public key...");
+    let mut hasher = Sha3_256::new();
+    hasher.update(shared_secret.raw_secret_bytes());
+    let key = &hasher.finalize();
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
+    let cipher = Aes256GcmSiv::new(key);
+    let mut encryptnonce = [0u8; 12];
+    rng.try_fill_bytes(&mut encryptnonce).unwrap();
+    let encryptnonce = Nonce::from_slice(&encryptnonce);
+    let mut cleartext = Vec::new();
+    let mut decryptnonce = [0u8; 12];
+    rng.try_fill_bytes(&mut decryptnonce).unwrap();
+    cleartext.extend_from_slice(&decryptnonce);
+    cleartext.extend_from_slice(
+        public_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .as_ref(),
+    );
+    let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(server_pk_bytes.as_bytes());
+    payload.extend_from_slice(encryptnonce);
+    payload.extend_from_slice(&ciphertext);
+    trace!("Sending server public key (65b), encryptnonce (12b), and encrypted RSA-2048 key...");
+    send_data(&payload, &stream);
+    trace!(
+        "Awaiting encryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
+    );
+    let payload = receive_data(&stream);
+    let ciphertext = match block_decrypt(&private_key, &payload) {
+        Ok(data) => data,
+        Err(e) => {
+            warn!(
+                "Client sent invalid bytes. Sending errorcode and dropping connection. {}",
+                e
             );
-            let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
-            let mut payload = Vec::new();
-            payload.extend_from_slice(server_pk_bytes.as_bytes());
-            payload.extend_from_slice(encryptnonce);
-            payload.extend_from_slice(&ciphertext);
-            trace!(
-                "Sending server public key (65b), encryptnonce (12b), and encrypted RSA-2048 key..."
-            );
-            send_data(&payload, &stream);
-            trace!(
-                "Awaiting encryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
-            );
-            let payload = receive_data(&stream);
-            let ciphertext = match block_decrypt(&private_key, &payload) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!(
-                        "Client sent invalid bytes. Sending errorcode and dropping connection. {}",
-                        e
-                    );
-                    send_data(&400_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    return;
-                }
-            };
-            let cleartext = match cipher.decrypt(Nonce::from_slice(&decryptnonce), &ciphertext[..])
-            {
-                Ok(data) => {
-                    if data.len() <= 12 {
-                        warn!(
-                            "Client data is too short (username must be at least 1b). Sending errorcode and dropping connection."
-                        );
-                        send_data(&401_i32.to_le_bytes(), &stream);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                        return;
-                    } else if data.len() > 267 {
-                        warn!(
-                            "Client data is too long (username must be less than 255b). Sending errorcode and dropping connection."
-                        );
-                        send_data(&402_i32.to_le_bytes(), &stream);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                        return;
-                    } else {
-                        data
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to decrypt data. Sending errorcode and dropping connection. {}",
-                        e
-                    );
-                    send_data(&400_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    return;
-                }
-            };
-            let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
-            trace!(
-                "Checking if requested user exists, and returning result to client (1 for yes, 2 for no)"
-            );
-            let username = &cleartext[12..];
-            let userexists = match sqlx::query!(
-                r#"SELECT COUNT(*) as count FROM users WHERE username = ?"#,
-                &username
-            )
-            .fetch_optional(&pool)
-            .await
-            {
-                Ok(Some(data)) => data.count,
-                Ok(None) => {
-                    warn!(
-                        "Unexpected response from database. Sending errorcode and dropping connection."
-                    );
-                    send_data(&500_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    return;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to query database. Sending errorcode and dropping connection. {}",
-                        e
-                    );
-                    send_data(&500_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    return;
-                }
-            };
-            if userexists > 2 {
+            send_data(&400_i32.to_le_bytes(), &stream);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    };
+    let cleartext = match cipher.decrypt(Nonce::from_slice(&decryptnonce), &ciphertext[..]) {
+        Ok(data) => {
+            if data.len() <= 12 {
                 warn!(
-                    "Invalid count of occurances for user {:?}! Sending errorcode and dropping connection.",
-                    &cleartext[12..]
+                    "Client data is too short (username must be at least 1b). Sending errorcode and dropping connection."
                 );
-                send_data(&500_i32.to_le_bytes(), &stream);
+                send_data(&401_i32.to_le_bytes(), &stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
+            } else if data.len() > 267 {
+                warn!(
+                    "Client data is too long (username must be less than 255b). Sending errorcode and dropping connection."
+                );
+                send_data(&402_i32.to_le_bytes(), &stream);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            } else {
+                data
             }
+        }
+        Err(e) => {
+            warn!(
+                "Failed to decrypt data. Sending errorcode and dropping connection. {}",
+                e
+            );
+            send_data(&400_i32.to_le_bytes(), &stream);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    };
+    let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
+    trace!("Checking if requested user exists.");
+    let username = &cleartext[12..];
+    let userexists = match sqlx::query!(
+        r#"SELECT COUNT(*) as count FROM users WHERE username = ?"#,
+        &username
+    )
+    .fetch_optional(&pool)
+    .await
+    {
+        Ok(Some(data)) => data.count,
+        Ok(None) => {
+            warn!("Unexpected response from database. Sending errorcode and dropping connection.");
+            send_data(&500_i32.to_le_bytes(), &stream);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        Err(e) => {
+            error!(
+                "Failed to query database. Sending errorcode and dropping connection. {}",
+                e
+            );
+            send_data(&500_i32.to_le_bytes(), &stream);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    };
+    if userexists > 2 {
+        warn!(
+            "Invalid count of occurances for user {:?}! Sending errorcode and dropping connection.",
+            &cleartext[12..]
+        );
+        send_data(&500_i32.to_le_bytes(), &stream);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return;
+    }
+    match parsed_data.indentifier {
+        0 => {
             let encryptnonce = Nonce::from_slice(&cleartext[..12]);
             rng.try_fill_bytes(&mut decryptnonce).unwrap();
             let mut cleartext = Vec::new();
@@ -325,24 +322,64 @@ async fn handle_connection(stream: TcpStream) {
             }
         }
         1 => {
-            trace!(
-                "Client resume session request with ID {:?}.",
-                parsed_data.payload
-            );
+            let (magic, encryptnonce) = match sqlx::query!(
+                r#"SELECT magic, nonce FROM users WHERE username = ?"#,
+                &username
+            )
+            .fetch_optional(&pool)
+            .await
+            {
+                Ok(Some(data)) => (
+                    data.magic.unwrap_or_else(|| {
+                        let mut fluff = [0; 255];
+                        let _ = rng.try_fill_bytes(&mut fluff);
+                        fluff.to_vec()
+                    }),
+                    data.nonce.unwrap_or_else(|| {
+                        let mut fluff = [0; 12];
+                        let _ = rng.try_fill_bytes(&mut fluff);
+                        fluff.to_vec()
+                    }),
+                ),
+                Ok(None) => {
+                    warn!(
+                        "Unexpected response from database. Sending errorcode and dropping connection."
+                    );
+                    send_data(&500_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to query database. Sending errorcode and dropping connection. {}",
+                        e
+                    );
+                    send_data(&500_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            };
+            let mut hasher = Sha3_256::new();
+            hasher.update(magic);
+            let key = &hasher.finalize();
+            let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
+            let cipher = Aes256GcmSiv::new(key);
             let num1 = rand_core::RngCore::next_u32(&mut OsRng);
             let num2 = rand_core::RngCore::next_u32(&mut OsRng);
-            let mut payload = Vec::new();
-            payload.extend_from_slice(&num1.to_le_bytes());
-            payload.extend_from_slice(&num2.to_le_bytes());
-            send_data(&payload, &stream);
-            if receive_data(&stream) == (num1 ^ num2).to_le_bytes().to_vec() {
-                println!("Session resumed!");
-            } else {
+            let mut cleartext = Vec::new();
+            cleartext.extend_from_slice(&num1.to_le_bytes());
+            cleartext.extend_from_slice(&num2.to_le_bytes());
+            let data = cipher
+                .encrypt(Nonce::from_slice(&encryptnonce), cleartext.as_ref())
+                .unwrap();
+            send_data(&data, &stream);
+            if receive_data(&stream) != (num1 ^ num2).to_le_bytes().to_vec() {
                 warn!("Verification failure. Sending vague errorcode, and dropping client.");
                 send_data(&501_i32.to_le_bytes(), &stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             }
+            send_data(b"session resumed!", &stream);
         }
         _ => {}
     }
@@ -402,6 +439,8 @@ async fn srp6_register(
     decryptnonce: &[u8],
 ) -> Vec<u8> {
     let mut rng = OsRng;
+    let mut magic = [0u8; 255];
+    rng.try_fill_bytes(&mut magic).unwrap();
     trace!("Generating userid...");
     let userid: [u8; 64] = loop {
         let mut userid = [0u8; 64];
@@ -452,14 +491,15 @@ async fn srp6_register(
     }
     match sqlx::query!(
         r#"
-        INSERT INTO users ( userid, username, salt, verifier, nonce )
-        VALUES ( ?, ?, ?, ?, ? )
+        INSERT INTO users ( userid, username, salt, verifier, nonce, magic )
+        VALUES ( ?, ?, ?, ?, ?, ? )
         "#,
         &userid[..],
         username,
         salt,
         verifier,
-        decryptnonce
+        decryptnonce,
+        &magic[..]
     )
     .execute(&pool)
     .await
@@ -475,5 +515,5 @@ async fn srp6_register(
             return Vec::new();
         }
     };
-    userid.to_vec()
+    magic.to_vec()
 }

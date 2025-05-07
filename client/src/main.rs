@@ -15,14 +15,14 @@ use std::{
 };
 use tracing::{debug, error, info, trace};
 use utils::{block_encrypt, receive_data, send_data};
+const SERVER: &str = "127.0.0.1:15496";
 fn main() {
     tracing_subscriber::fmt().init();
-    let server = "127.0.0.1:15496";
-    let Ok(stream) = TcpStream::connect(server) else {
+    let Ok(stream) = TcpStream::connect(SERVER) else {
         error!("Failed to connect to server");
         return;
     };
-    info!("Connected to {}", server);
+    info!("Connected to {}", SERVER);
     //
     new_session(&stream);
     //resume_session(&stream);
@@ -34,9 +34,9 @@ fn new_session(stream: &TcpStream) {
     trace!("Generating client secret... (Diffie-Hellman)");
     let client_secret = EphemeralSecret::random(&mut OsRng);
     let client_pk_bytes = EncodedPoint::from(client_secret.public_key());
-    trace!("Sending new session request with Diffie-Hellman handshake...");
+    trace!("Initiating new session request with Diffie-Hellman handshake...");
     let mut payload = vec![0];
-    payload.extend(client_pk_bytes.as_bytes());
+    payload.extend_from_slice(client_pk_bytes.as_bytes());
     trace!("Sending client public key...");
     send_data(&payload, stream);
     trace!("Requesting username...");
@@ -48,7 +48,7 @@ fn new_session(stream: &TcpStream) {
         "Awaiting server public key (65b), decryptnonce (12b), and encrypted RSA-2048 public key..."
     );
     let payload = receive_data(stream);
-    print!("\r");
+    print!("\x1B[2K\r");
     let server_public =
         PublicKey::from_sec1_bytes(&payload[0..65]).expect("Invalid server public key!");
     let shared_secret = client_secret.diffie_hellman(&server_public);
@@ -99,29 +99,96 @@ fn new_session(stream: &TcpStream) {
             .decrypt(Nonce::from_slice(&decryptnonce), &response[..])
             .unwrap();
         let encryptnonce = &cleartext[..12];
-        let userid = &cleartext[12..];
-        println!("UserID: {:?}, nextnonce: {:?}", userid, encryptnonce);
+        let magic = &cleartext[12..];
+        trace!("Registration successful. Creating a new session to server, and logging in.");
+        resume_session(
+            &TcpStream::connect(SERVER).unwrap(),
+            Some(username),
+            magic,
+            encryptnonce,
+        );
+        //println!("magic: {:?}, nextnonce: {:?}", magic, encryptnonce);
     } else {
         login(username);
     };
 }
 
-fn _resume_session(stream: &TcpStream) {
-    trace!("Resume session requested. Sending session ID...");
+fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], nextnonce: &[u8]) {
+    let mut rng = OsRng;
+    debug!("Resume session requested.");
+    trace!("Generating client secret... (Diffie-Hellman)");
+    let client_secret = EphemeralSecret::random(&mut OsRng);
+    let client_pk_bytes = EncodedPoint::from(client_secret.public_key());
+    trace!("Initiating new session request with Diffie-Hellman handshake...");
     let mut payload = Vec::new();
     payload.extend_from_slice(&[1u8]);
+    payload.extend_from_slice(client_pk_bytes.as_bytes());
+    trace!("Sending client public key...");
+    send_data(&payload, stream);
+    let username = match usernameraw {
+        Some(username) => username.to_vec(),
+        None => {
+            trace!("Requesting username...");
+            request("Username: ", false).into_bytes()
+        }
+    };
+    print!("Awaiting response from server\x1B[31m.\x1B[32m.\x1B[33m.\x1B[0m");
+    io::stdout().flush().unwrap();
+    trace!(
+        "Awaiting server public key (65b), decryptnonce (12b), and encrypted RSA-2048 public key..."
+    );
+    let payload = receive_data(stream);
+    print!("\x1B[2K\r");
+    let server_public =
+        PublicKey::from_sec1_bytes(&payload[0..65]).expect("Invalid server public key!");
+    let shared_secret = client_secret.diffie_hellman(&server_public);
+    trace!("Shared secret derived!");
+    trace!("Deriving public key...");
+    let mut hasher = Sha3_256::new();
+    hasher.update(shared_secret.raw_secret_bytes());
+    let key = &hasher.finalize();
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
+    let cipher = Aes256GcmSiv::new(key);
+    let decryptnonce = Nonce::from_slice(&payload[65..77]);
+    let cleartext = cipher.decrypt(decryptnonce, &payload[77..]).unwrap();
+    let encryptnonce = Nonce::from_slice(&cleartext[0..12]);
+    let public_key =
+        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext[12..])).unwrap();
+    trace!(
+        "Sending decryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
+    );
+    let mut decryptnonce = [0; 12];
+    rng.try_fill_bytes(&mut decryptnonce).unwrap();
+    let mut cleartext = Vec::new();
+    cleartext.extend_from_slice(&decryptnonce);
+    cleartext.extend_from_slice(&username);
+    let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+    let payload = block_encrypt(&public_key, &ciphertext).unwrap();
     send_data(&payload, stream);
     trace!("Awaiting sum from server...");
-    let rawdata = receive_data(stream);
+    let response = receive_data(stream);
+    if response.len() == 4 {
+        error_decode(&response);
+    }
+    let mut hasher = Sha3_256::new();
+    hasher.update(magic);
+    let key = &hasher.finalize();
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
+    let cipher = Aes256GcmSiv::new(key);
+    let rawdata = cipher
+        .decrypt(Nonce::from_slice(nextnonce), response.as_ref())
+        .unwrap();
     let num1 = u32::from_le_bytes(rawdata[..4].try_into().unwrap());
     let num2 = u32::from_le_bytes(rawdata[4..8].try_into().unwrap());
-    let sum = num1 & num2;
+    let sum = num1 ^ num2;
     trace!("returning XOR result... ");
     send_data(&sum.to_le_bytes(), stream);
     let payload = receive_data(stream);
     if payload.len() == 4 {
         error_decode(&payload);
     }
+    trace!("Login successful!");
+    println!("We are... in.");
 }
 
 fn salt_verifier(username: &[u8]) -> Vec<u8> {
