@@ -10,6 +10,7 @@ use rsa::{
 };
 use sha3::{Digest, Sha3_256, digest::generic_array::GenericArray};
 use sqlx::mysql::MySqlPool;
+use srp6::prelude::*;
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
@@ -310,7 +311,7 @@ async fn handle_connection(stream: TcpStream) {
                         let mut plaintext = Vec::new();
                         plaintext.extend_from_slice(&decryptnonce);
                         plaintext.extend_from_slice(
-                            &srp6_register(username, pool, &stream, salt, verifier, &decryptnonce)
+                            &srp6_register(username, &pool, &stream, salt, verifier, &decryptnonce)
                                 .await,
                         );
                         let data = cipher
@@ -322,7 +323,7 @@ async fn handle_connection(stream: TcpStream) {
             }
         }
         1 => {
-            let (magic, encryptnonce) = match sqlx::query!(
+            let (magic, mut encryptnonce) = match sqlx::query!(
                 r#"SELECT magic, nonce FROM users WHERE username = ?"#,
                 &username
             )
@@ -364,22 +365,64 @@ async fn handle_connection(stream: TcpStream) {
             let key = &hasher.finalize();
             let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
             let cipher = Aes256GcmSiv::new(key);
-            let num1 = rand_core::RngCore::next_u32(&mut OsRng);
-            let num2 = rand_core::RngCore::next_u32(&mut OsRng);
-            let mut cleartext = Vec::new();
-            cleartext.extend_from_slice(&num1.to_le_bytes());
-            cleartext.extend_from_slice(&num2.to_le_bytes());
-            let data = cipher
-                .encrypt(Nonce::from_slice(&encryptnonce), cleartext.as_ref())
-                .unwrap();
-            send_data(&data, &stream);
-            if receive_data(&stream) != (num1 ^ num2).to_le_bytes().to_vec() {
+            let mut failed = false;
+            for i in 0..7 {
+                let num1 = rand_core::RngCore::next_u64(&mut OsRng);
+                let num2 = rand_core::RngCore::next_u64(&mut OsRng);
+                let mut decryptnonce = [0; 12];
+                rng.try_fill_bytes(&mut decryptnonce).unwrap();
+                let mut cleartext = Vec::new();
+                cleartext.extend_from_slice(&decryptnonce);
+                cleartext.extend_from_slice(&num1.to_le_bytes());
+                cleartext.extend_from_slice(&num2.to_le_bytes());
+                let data = cipher
+                    .encrypt(Nonce::from_slice(&encryptnonce), cleartext.as_ref())
+                    .unwrap();
+                send_data(&data, &stream);
+                let response = receive_data(&stream);
+                let data = match cipher.decrypt(Nonce::from_slice(&decryptnonce), &response[..]) {
+                    Ok(data) => {
+                        if data.len() <= 12 {
+                            warn!(
+                                "Client data is too short (username must be at least 1b). Sending errorcode and dropping connection."
+                            );
+                            send_data(&401_i32.to_le_bytes(), &stream);
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            return;
+                        } else {
+                            data
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to decrypt data. Sending errorcode and dropping connection. {}",
+                            e
+                        );
+                        send_data(&400_i32.to_le_bytes(), &stream);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                };
+                let nextnonce = &data[..12];
+                if data[12..].to_vec() != (num1 ^ num2).to_le_bytes().to_vec() {
+                    warn!("Client failed verification round {}/7", i);
+                    failed = true;
+                }
+                encryptnonce = nextnonce.to_vec();
+            }
+            if failed {
                 warn!("Verification failure. Sending vague errorcode, and dropping client.");
                 send_data(&501_i32.to_le_bytes(), &stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             }
+            trace!("Client passed all 7 verification rounds.");
             send_data(b"session resumed!", &stream);
+        }
+        2 => {
+            let srp = Srp6_4096::default();
+            let (handshake, _proof_verifier) =
+                srp.start_handshake(&get_user_details(username, &pool).await);
         }
         _ => {}
     }
@@ -432,7 +475,7 @@ fn retreive_config(path: &str) -> String {
 
 async fn srp6_register(
     username: &[u8],
-    pool: MySqlPool,
+    pool: &MySqlPool,
     stream: &TcpStream,
     salt: &[u8],
     verifier: &[u8],
@@ -446,7 +489,7 @@ async fn srp6_register(
         let mut userid = [0u8; 64];
         rng.try_fill_bytes(&mut userid).unwrap();
         let result = match sqlx::query!(r#"SELECT userid FROM users WHERE userid = ?"#, &userid[..])
-            .fetch_optional(&pool)
+            .fetch_optional(pool)
             .await
         {
             Ok(data) => data,
@@ -466,7 +509,7 @@ async fn srp6_register(
     };
     trace!("Checking if user exists...");
     if match sqlx::query!(r#"SELECT userid FROM users WHERE username = ?"#, &username)
-        .fetch_optional(&pool)
+        .fetch_optional(pool)
         .await
     {
         Ok(data) => data,
@@ -501,7 +544,7 @@ async fn srp6_register(
         decryptnonce,
         &magic[..]
     )
-    .execute(&pool)
+    .execute(pool)
     .await
     {
         Ok(_) => {}
@@ -516,4 +559,31 @@ async fn srp6_register(
         }
     };
     magic.to_vec()
+}
+
+async fn get_user_details(username: &[u8], pool: &MySqlPool) -> UserSecrets {
+    match sqlx::query!(
+        "SELECT salt, verifier FROM users WHERE username = ?",
+        username
+    )
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(data)) => UserSecrets {
+            username: String::from_utf8_lossy(username).to_string(),
+            salt: srp6::prelude::BigNumber::from(&data.salt[..]),
+            verifier: srp6::prelude::BigNumber::from(&data.verifier[..]),
+        },
+        _ => {
+            warn!("Invalid logon session sent by client");
+            let (mut salt, mut verifier) = ([0u8; 256], [0u8; 256]);
+            let _ = OsRng.try_fill_bytes(&mut salt);
+            let _ = OsRng.try_fill_bytes(&mut verifier);
+            UserSecrets {
+                username: String::from_utf8_lossy(username).to_string(),
+                salt: Salt::from(salt),
+                verifier: PasswordVerifier::from(verifier),
+            }
+        }
+    }
 }

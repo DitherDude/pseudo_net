@@ -83,6 +83,9 @@ fn new_session(stream: &TcpStream) {
         .decrypt(Nonce::from_slice(&decryptnonce), &response[..])
         .unwrap();
     let encryptnonce = Nonce::from_slice(&cleartext[..12]);
+    let serverip = stream.peer_addr().unwrap().ip().to_string()
+        + ":"
+        + &stream.peer_addr().unwrap().port().to_string();
     if i64::from_le_bytes(cleartext[12..20].try_into().unwrap()) == 0 {
         let mut plaintext = Vec::new();
         rng.try_fill_bytes(&mut decryptnonce).unwrap();
@@ -102,14 +105,14 @@ fn new_session(stream: &TcpStream) {
         let magic = &cleartext[12..];
         trace!("Registration successful. Creating a new session to server, and logging in.");
         resume_session(
-            &TcpStream::connect(SERVER).unwrap(),
+            &TcpStream::connect(&serverip).unwrap(),
             Some(username),
             magic,
             encryptnonce,
         );
         //println!("magic: {:?}, nextnonce: {:?}", magic, encryptnonce);
     } else {
-        login(username);
+        login(&TcpStream::connect(&serverip).unwrap(), Some(username));
     };
 }
 
@@ -122,6 +125,116 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
     trace!("Initiating new session request with Diffie-Hellman handshake...");
     let mut payload = Vec::new();
     payload.extend_from_slice(&[1u8]);
+    payload.extend_from_slice(client_pk_bytes.as_bytes());
+    trace!("Sending client public key...");
+    send_data(&payload, stream);
+    let username = match usernameraw {
+        Some(username) => username.to_vec(),
+        None => {
+            trace!("Requesting username...");
+            request("Username: ", false).into_bytes()
+        }
+    };
+    print!("Awaiting response from server\x1B[31m.\x1B[32m.\x1B[33m.\x1B[0m");
+    io::stdout().flush().unwrap();
+    trace!(
+        "Awaiting server public key (65b), decryptnonce (12b), and encrypted RSA-2048 public key..."
+    );
+    let payload = receive_data(stream);
+    print!("\x1B[2K\r");
+    let server_public =
+        PublicKey::from_sec1_bytes(&payload[0..65]).expect("Invalid server public key!");
+    let shared_secret = client_secret.diffie_hellman(&server_public);
+    trace!("Shared secret derived!");
+    trace!("Deriving public key...");
+    let mut hasher = Sha3_256::new();
+    hasher.update(shared_secret.raw_secret_bytes());
+    let key = &hasher.finalize();
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
+    let cipher = Aes256GcmSiv::new(key);
+    let decryptnonce = Nonce::from_slice(&payload[65..77]);
+    let cleartext = cipher.decrypt(decryptnonce, &payload[77..]).unwrap();
+    let mut encryptnonce = Nonce::from_slice(&cleartext[0..12]);
+    let public_key =
+        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext[12..])).unwrap();
+    trace!(
+        "Sending decryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
+    );
+    let mut decryptnonce = [0; 12];
+    let _ = rng.try_fill_bytes(&mut decryptnonce);
+    let mut cleartext = Vec::new();
+    cleartext.extend_from_slice(&decryptnonce);
+    cleartext.extend_from_slice(&username);
+    let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+    let payload = block_encrypt(&public_key, &ciphertext).unwrap();
+    send_data(&payload, stream);
+    let mut hasher = Sha3_256::new();
+    hasher.update(magic);
+    let key = &hasher.finalize();
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
+    let cipher = Aes256GcmSiv::new(key);
+    decryptnonce = nextnonce.try_into().unwrap();
+    for i in 0..7 {
+        trace!("Awaiting sum from server ({}/7)...", i);
+        let response = receive_data(stream);
+        if response.len() == 4 {
+            error_decode(&response);
+        }
+        let rawdata = cipher
+            .decrypt(Nonce::from_slice(&decryptnonce), response.as_ref())
+            .unwrap();
+        encryptnonce = Nonce::from_slice(&rawdata[..12]);
+        let num1 = u64::from_le_bytes(rawdata[12..20].try_into().unwrap());
+        let num2 = u64::from_le_bytes(rawdata[20..28].try_into().unwrap());
+        let sum = num1 ^ num2;
+        let _ = rng.try_fill_bytes(&mut decryptnonce);
+        let mut data = Vec::new();
+        data.extend_from_slice(&decryptnonce);
+        data.extend_from_slice(&sum.to_le_bytes());
+        let payload = cipher.encrypt(encryptnonce, data.as_ref()).unwrap();
+        trace!("returning XOR result... ");
+        send_data(&payload, stream);
+    }
+    let payload = receive_data(stream);
+    if payload.len() == 4 {
+        error_decode(&payload);
+    }
+    trace!("Login successful!");
+    println!("We are... in.");
+}
+
+fn salt_verifier(username: &[u8]) -> Vec<u8> {
+    if !choice(
+        "The specified account does not exist. Would you like to create it? [y/n] ",
+        "Registering a new account.",
+        "Will not register a new account. Aborting program.",
+    ) {
+        exit(0);
+    }
+    let password = ClearTextPassword::from(request("Password: ", true));
+    let password2 = ClearTextPassword::from(request("Confirm password: ", true));
+    if password != password2 {
+        error!("Passwords do not match!");
+        exit(1);
+    }
+    let (salt, verifier) = Srp6_4096::default()
+        .generate_new_user_secrets(&Username::from_utf8_lossy(username), &password);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&salt.to_vec());
+    payload.extend_from_slice(&verifier.to_vec());
+    payload
+}
+
+fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> Vec<u8> {
+    let password = ClearTextPassword::from(request("Password: ", true));
+    let mut rng = OsRng;
+    debug!("Login session requested.");
+    trace!("Generating client secret... (Diffie-Hellman)");
+    let client_secret = EphemeralSecret::random(&mut OsRng);
+    let client_pk_bytes = EncodedPoint::from(client_secret.public_key());
+    trace!("Initiating new session request with Diffie-Hellman handshake...");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[2u8]);
     payload.extend_from_slice(client_pk_bytes.as_bytes());
     trace!("Sending client public key...");
     send_data(&payload, stream);
@@ -165,56 +278,7 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
     let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
     let payload = block_encrypt(&public_key, &ciphertext).unwrap();
     send_data(&payload, stream);
-    trace!("Awaiting sum from server...");
-    let response = receive_data(stream);
-    if response.len() == 4 {
-        error_decode(&response);
-    }
-    let mut hasher = Sha3_256::new();
-    hasher.update(magic);
-    let key = &hasher.finalize();
-    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
-    let cipher = Aes256GcmSiv::new(key);
-    let rawdata = cipher
-        .decrypt(Nonce::from_slice(nextnonce), response.as_ref())
-        .unwrap();
-    let num1 = u32::from_le_bytes(rawdata[..4].try_into().unwrap());
-    let num2 = u32::from_le_bytes(rawdata[4..8].try_into().unwrap());
-    let sum = num1 ^ num2;
-    trace!("returning XOR result... ");
-    send_data(&sum.to_le_bytes(), stream);
-    let payload = receive_data(stream);
-    if payload.len() == 4 {
-        error_decode(&payload);
-    }
-    trace!("Login successful!");
-    println!("We are... in.");
-}
-
-fn salt_verifier(username: &[u8]) -> Vec<u8> {
-    if !choice(
-        "The specified account does not exist. Would you like to create it? [y/n] ",
-        "Registering a new account.",
-        "Will not register a new account. Aborting program.",
-    ) {
-        exit(0);
-    }
-    let password = ClearTextPassword::from(request("Password: ", true));
-    let password2 = ClearTextPassword::from(request("Confirm password: ", true));
-    if password != password2 {
-        error!("Passwords do not match!");
-        exit(1);
-    }
-    let (salt, verifier) = Srp6_4096::default()
-        .generate_new_user_secrets(&Username::from_utf8_lossy(username), &password);
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&salt.to_vec());
-    payload.extend_from_slice(&verifier.to_vec());
-    payload
-}
-
-fn login(_username: &[u8]) -> Vec<u8> {
-    let _password = ClearTextPassword::from(request("Password: ", true));
+    trace!("Awaiting handshake from server...");
     Vec::new()
 }
 
