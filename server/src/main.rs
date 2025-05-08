@@ -97,16 +97,19 @@ async fn main() {
     let port = retreive_config("PORT").parse::<u16>().unwrap_or(15496);
     let listener = TcpListener::bind("127.0.0.1:".to_owned() + &port.to_string()).unwrap();
     info!("Server listening on 127.0.0.1:{}", port);
+    let mut connid = 0u128;
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                connid += 1;
                 trace!(
-                    "New connection from {}:{}",
+                    "New connection from {}:{} (ID: {})",
                     stream.peer_addr().unwrap().ip(),
-                    stream.peer_addr().unwrap().port()
+                    stream.peer_addr().unwrap().port(),
+                    connid
                 );
-                async_std::task::spawn(async {
-                    handle_connection(stream).await;
+                async_std::task::spawn(async move {
+                    handle_connection(stream, connid).await;
                 });
             }
             Err(e) => {
@@ -116,29 +119,41 @@ async fn main() {
     }
 }
 
-async fn handle_connection(stream: TcpStream) {
+async fn handle_connection(stream: TcpStream, id: u128) {
     let mut rng = OsRng;
     let parsed_data = parse_data(&receive_data(&stream));
     if parsed_data.indentifier == 0 {
-        trace!("Client new session request. Initiating Diffie-Hellman handshake...");
+        trace!(
+            "Client-{} new session request. Initiating Diffie-Hellman handshake...",
+            id
+        );
     } else if parsed_data.indentifier == 1 {
-        trace!("Client resume session request. Initiating Diffie-Hellman handshake...");
+        trace!(
+            "Client-{} resume session request. Initiating Diffie-Hellman handshake...",
+            id
+        );
     }
     let server_secret = EphemeralSecret::random(&mut rng);
     let server_pk_bytes = EncodedPoint::from(server_secret.public_key());
-    trace!("Decoding client public key... (sent along with indentifier)");
+    trace!(
+        "Decoding client-{} public key... (sent along with indentifier)",
+        id
+    );
     let client_public = match PublicKey::from_sec1_bytes(parsed_data.payload.as_ref()) {
         Ok(data) => data,
         Err(e) => {
-            warn!("Failed to decode client public key: {}", e);
+            warn!("Failed to decode client-{} public key: {}", id, e);
             let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
     };
     let shared_secret = server_secret.diffie_hellman(&client_public);
-    trace!("Shared secret derived!");
-    let (private_key, public_key) = generate_keys();
-    trace!("Keypair generated. Encrypting public key...");
+    trace!("Shared secret derived from Client-{}!", id);
+    let (private_key, public_key) = generate_keys(id);
+    trace!(
+        "Keypair generated for Client-{}. Encrypting public key...",
+        id
+    );
     let mut hasher = Sha3_256::new();
     hasher.update(shared_secret.raw_secret_bytes());
     let key = &hasher.finalize();
@@ -162,18 +177,22 @@ async fn handle_connection(stream: TcpStream) {
     payload.extend_from_slice(server_pk_bytes.as_bytes());
     payload.extend_from_slice(encryptnonce);
     payload.extend_from_slice(&ciphertext);
-    trace!("Sending server public key (65b), encryptnonce (12b), and encrypted RSA-2048 key...");
+    trace!(
+        "Sending server public key (65b), encryptnonce (12b), and encrypted RSA-2048 key from Client-{}...",
+        id
+    );
     send_data(&payload, &stream);
     trace!(
-        "Awaiting encryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
+        "Awaiting encryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key from Client-{}...",
+        id
     );
     let payload = receive_data(&stream);
     let ciphertext = match block_decrypt(&private_key, &payload) {
         Ok(data) => data,
         Err(e) => {
             warn!(
-                "Client sent invalid bytes. Sending errorcode and dropping connection. {}",
-                e
+                "Client-{} sent invalid bytes. Sending errorcode and dropping connection. {}",
+                id, e
             );
             send_data(&400_i32.to_le_bytes(), &stream);
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -184,14 +203,16 @@ async fn handle_connection(stream: TcpStream) {
         Ok(data) => {
             if data.len() <= 12 {
                 warn!(
-                    "Client data is too short (username must be at least 1b). Sending errorcode and dropping connection."
+                    "Client-{} data is too short (username must be at least 1b). Sending errorcode and dropping connection.",
+                    id
                 );
                 send_data(&401_i32.to_le_bytes(), &stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             } else if data.len() > 267 {
                 warn!(
-                    "Client data is too long (username must be less than 255b). Sending errorcode and dropping connection."
+                    "Client-{} data is too long (username must be less than 255b). Sending errorcode and dropping connection.",
+                    id
                 );
                 send_data(&402_i32.to_le_bytes(), &stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -202,8 +223,8 @@ async fn handle_connection(stream: TcpStream) {
         }
         Err(e) => {
             warn!(
-                "Failed to decrypt data. Sending errorcode and dropping connection. {}",
-                e
+                "Failed to decrypt data from client-{}. Sending errorcode and dropping connection. {}",
+                id, e
             );
             send_data(&400_i32.to_le_bytes(), &stream);
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -211,7 +232,11 @@ async fn handle_connection(stream: TcpStream) {
         }
     };
     let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
-    trace!("Checking if requested user exists.");
+    trace!(
+        "Checking if Client-{}'s requested user \"{:?}\" exists.",
+        id,
+        &cleartext[12..]
+    );
     let username = &cleartext[12..];
     let userexists = match sqlx::query!(
         r#"SELECT COUNT(*) as count FROM users WHERE username = ?"#,
@@ -222,15 +247,18 @@ async fn handle_connection(stream: TcpStream) {
     {
         Ok(Some(data)) => data.count,
         Ok(None) => {
-            warn!("Unexpected response from database. Sending errorcode and dropping connection.");
+            warn!(
+                "Unexpected response from database. Sending errorcode to Client-{} and dropping connection.",
+                id
+            );
             send_data(&500_i32.to_le_bytes(), &stream);
             let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
         Err(e) => {
             error!(
-                "Failed to query database. Sending errorcode and dropping connection. {}",
-                e
+                "Failed to query database. Sending errorcode to Client-{} and dropping connection. {}",
+                id, e
             );
             send_data(&500_i32.to_le_bytes(), &stream);
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -239,8 +267,9 @@ async fn handle_connection(stream: TcpStream) {
     };
     if userexists > 2 {
         warn!(
-            "Invalid count of occurances for user {:?}! Sending errorcode and dropping connection.",
-            &cleartext[12..]
+            "Invalid count of occurances for user {:?}! Sending errorcode to Client-{} and dropping connection.",
+            &cleartext[12..],
+            id
         );
         send_data(&500_i32.to_le_bytes(), &stream);
         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -263,8 +292,8 @@ async fn handle_connection(stream: TcpStream) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!(
-                            "Client sent invalid bytes. Sending errorcode and dropping connection. {}",
-                            e
+                            "Client-{} sent invalid bytes. Sending errorcode and dropping connection. {}",
+                            id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -277,8 +306,8 @@ async fn handle_connection(stream: TcpStream) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!(
-                            "Failed to decrypt data. Sending errorcode and dropping connection. {}",
-                            e
+                            "Failed to decrypt data. Sending errorcode to Client-{} and dropping connection. {}",
+                            id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -288,8 +317,8 @@ async fn handle_connection(stream: TcpStream) {
                 match payload.len().cmp(&1036) {
                     Less => {
                         warn!(
-                            "Client data is too short (expecting 1036b). Sending errorcode and dropping connection. {}",
-                            payload.len()
+                            "Client-{} data is too short (expecting 1036b). Sending errorcode and dropping connection.",
+                            id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -297,7 +326,8 @@ async fn handle_connection(stream: TcpStream) {
                     }
                     Greater => {
                         warn!(
-                            "Client data is too long (expecting 1036b). Sending errorcode and dropping connection."
+                            "Client-{} data is too long (expecting 1036b). Sending errorcode and dropping connection.",
+                            id
                         );
                         send_data(&402_i32.to_le_bytes(), &stream);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -311,8 +341,16 @@ async fn handle_connection(stream: TcpStream) {
                         let mut plaintext = Vec::new();
                         plaintext.extend_from_slice(&decryptnonce);
                         plaintext.extend_from_slice(
-                            &srp6_register(username, &pool, &stream, salt, verifier, &decryptnonce)
-                                .await,
+                            &srp6_register(
+                                username,
+                                &pool,
+                                &stream,
+                                salt,
+                                verifier,
+                                &decryptnonce,
+                                id,
+                            )
+                            .await,
                         );
                         let data = cipher
                             .encrypt(Nonce::from_slice(encryptnonce), plaintext.as_ref())
@@ -344,7 +382,8 @@ async fn handle_connection(stream: TcpStream) {
                 ),
                 Ok(None) => {
                     warn!(
-                        "Unexpected response from database. Sending errorcode and dropping connection."
+                        "Unexpected response from database. Sending errorcode to Client-{} and dropping connection.",
+                        id
                     );
                     send_data(&500_i32.to_le_bytes(), &stream);
                     let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -352,8 +391,8 @@ async fn handle_connection(stream: TcpStream) {
                 }
                 Err(e) => {
                     error!(
-                        "Failed to query database. Sending errorcode and dropping connection. {}",
-                        e
+                        "Failed to query database. Sending errorcode to Client-{} and dropping connection. {}",
+                        id, e
                     );
                     send_data(&500_i32.to_le_bytes(), &stream);
                     let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -384,7 +423,8 @@ async fn handle_connection(stream: TcpStream) {
                     Ok(data) => {
                         if data.len() <= 12 {
                             warn!(
-                                "Client data is too short (username must be at least 1b). Sending errorcode and dropping connection."
+                                "Client-{} data is too short (username must be at least 1b). Sending errorcode and dropping connection.",
+                                id
                             );
                             send_data(&401_i32.to_le_bytes(), &stream);
                             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -395,8 +435,8 @@ async fn handle_connection(stream: TcpStream) {
                     }
                     Err(e) => {
                         warn!(
-                            "Failed to decrypt data. Sending errorcode and dropping connection. {}",
-                            e
+                            "Failed to decrypt data. Sending errorcode to Client-{} and dropping connection. {}",
+                            id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -405,41 +445,46 @@ async fn handle_connection(stream: TcpStream) {
                 };
                 let nextnonce = &data[..12];
                 if data[12..].to_vec() != (num1 ^ num2).to_le_bytes().to_vec() {
-                    warn!("Client failed verification round {}/7", i);
+                    warn!("Client-{} failed verification round {}/7", id, i);
                     failed = true;
                 }
                 encryptnonce = nextnonce.to_vec();
             }
             if failed {
-                warn!("Verification failure. Sending vague errorcode, and dropping client.");
+                warn!(
+                    "Verification failure. Sending vague errorcode, and dropping Client-{}.",
+                    id
+                );
                 send_data(&501_i32.to_le_bytes(), &stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             }
-            trace!("Client passed all 7 verification rounds.");
+            trace!("Client-{} passed all 7 verification rounds.", id);
             send_data(b"session resumed!", &stream);
         }
         2 => {
             let srp = Srp6_4096::default();
             let (handshake, _proof_verifier) =
-                srp.start_handshake(&get_user_details(username, &pool).await);
+                srp.start_handshake(&get_user_details(username, &pool, id).await);
         }
         _ => {}
     }
     trace!(
-        "Connection from {}:{} closed.",
+        "Connection from {}:{} closed. (ID: {})",
         stream.peer_addr().unwrap().ip(),
-        stream.peer_addr().unwrap().port()
+        stream.peer_addr().unwrap().port(),
+        id
     );
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
-fn generate_keys() -> (RsaPrivateKey, RsaPublicKey) {
+fn generate_keys(id: u128) -> (RsaPrivateKey, RsaPublicKey) {
     let bits = retreive_config("BITS").parse::<usize>().unwrap_or(2048);
-    trace!("Generating keys...");
+    trace!("Generating keys for Client-{}...", id);
     let mut rng = OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, bits).unwrap();
     let public_key = RsaPublicKey::from(&private_key);
-    trace!("Keys generated.");
+    trace!("Keys generated for Client-{}.", id);
     (private_key, public_key)
 }
 
@@ -480,6 +525,7 @@ async fn srp6_register(
     salt: &[u8],
     verifier: &[u8],
     decryptnonce: &[u8],
+    id: u128,
 ) -> Vec<u8> {
     let mut rng = OsRng;
     let mut magic = [0u8; 255];
@@ -495,8 +541,8 @@ async fn srp6_register(
             Ok(data) => data,
             Err(e) => {
                 error!(
-                    "Failed to query database. Sending errorcode and dropping client. {}",
-                    e
+                    "Failed to query database. Sending errorcode and dropping Client-{}. {}",
+                    id, e
                 );
                 send_data(&500_i32.to_le_bytes(), stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -515,8 +561,8 @@ async fn srp6_register(
         Ok(data) => data,
         Err(e) => {
             error!(
-                "Failed to query database. Sending errorcode and dropping client. {}",
-                e
+                "Failed to query database. Sending errorcode and dropping Client-{}. {}",
+                id, e
             );
             send_data(&500_i32.to_le_bytes(), stream);
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -526,7 +572,8 @@ async fn srp6_register(
     .is_some()
     {
         warn!(
-            "Attempting to register a user that already exists. Sending vague errorcode, and dropping client."
+            "Attempting to register a user that already exists. Sending vague errorcode, and dropping Client-{}.",
+            id
         );
         send_data(&400_i32.to_le_bytes(), stream);
         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -550,8 +597,8 @@ async fn srp6_register(
         Ok(_) => {}
         Err(e) => {
             warn!(
-                "Failed to insert user. Sending errorcode and dropping client. {}",
-                e
+                "Failed to insert user. Sending errorcode and dropping Client-{}. {}",
+                id, e
             );
             send_data(&500_i32.to_le_bytes(), stream);
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -561,7 +608,7 @@ async fn srp6_register(
     magic.to_vec()
 }
 
-async fn get_user_details(username: &[u8], pool: &MySqlPool) -> UserSecrets {
+async fn get_user_details(username: &[u8], pool: &MySqlPool, id: u128) -> UserSecrets {
     match sqlx::query!(
         "SELECT salt, verifier FROM users WHERE username = ?",
         username
@@ -575,7 +622,7 @@ async fn get_user_details(username: &[u8], pool: &MySqlPool) -> UserSecrets {
             verifier: srp6::prelude::BigNumber::from(&data.verifier[..]),
         },
         _ => {
-            warn!("Invalid logon session sent by client");
+            warn!("Invalid logon session sent by Client-{}", id);
             let (mut salt, mut verifier) = ([0u8; 256], [0u8; 256]);
             let _ = OsRng.try_fill_bytes(&mut salt);
             let _ = OsRng.try_fill_bytes(&mut verifier);
