@@ -203,7 +203,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
         Ok(data) => {
             if data.len() <= 12 {
                 warn!(
-                    "Client-{} data is too short (username must be at least 1b). Sending errorcode and dropping connection.",
+                    "Data is too short (username must be at least 1b). Sending errorcode and dropping Client-{}.",
                     id
                 );
                 send_data(&401_i32.to_le_bytes(), &stream);
@@ -211,7 +211,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
                 return;
             } else if data.len() > 267 {
                 warn!(
-                    "Client-{} data is too long (username must be less than 255b). Sending errorcode and dropping connection.",
+                    "Data is too long (username must be less than 255b). Sending errorcode and dropping Client-{}.",
                     id
                 );
                 send_data(&402_i32.to_le_bytes(), &stream);
@@ -248,7 +248,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
         Ok(Some(data)) => data.count,
         Ok(None) => {
             warn!(
-                "Unexpected response from database. Sending errorcode to Client-{} and dropping connection.",
+                "Unexpected response from database. Sending errorocode and dropping Client-{}.",
                 id
             );
             send_data(&500_i32.to_le_bytes(), &stream);
@@ -257,7 +257,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
         }
         Err(e) => {
             error!(
-                "Failed to query database. Sending errorcode to Client-{} and dropping connection. {}",
+                "Failed to query database. Sending errorocode and dropping Client-{}. {}",
                 id, e
             );
             send_data(&500_i32.to_le_bytes(), &stream);
@@ -267,7 +267,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
     };
     if userexists > 2 {
         warn!(
-            "Invalid count of occurances for user {:?}! Sending errorcode to Client-{} and dropping connection.",
+            "Invalid count of occurances for user {:?}! Sending errorocode and dropping Client-{}.",
             &cleartext[12..],
             id
         );
@@ -306,7 +306,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!(
-                            "Failed to decrypt data. Sending errorcode to Client-{} and dropping connection. {}",
+                            "Failed to decrypt data. Sending errorocode and dropping Client-{}. {}",
                             id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
@@ -317,7 +317,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
                 match payload.len().cmp(&1036) {
                     Less => {
                         warn!(
-                            "Client-{} data is too short (expecting 1036b). Sending errorcode and dropping connection.",
+                            "Data is too short (expecting 1036b). Sending errorcode and dropping Client-{}.",
                             id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
@@ -326,7 +326,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
                     }
                     Greater => {
                         warn!(
-                            "Client-{} data is too long (expecting 1036b). Sending errorcode and dropping connection.",
+                            "Data is too long (expecting 1036b). Sending errorcode and dropping Client-{}.",
                             id
                         );
                         send_data(&402_i32.to_le_bytes(), &stream);
@@ -382,7 +382,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
                 ),
                 Ok(None) => {
                     warn!(
-                        "Unexpected response from database. Sending errorcode to Client-{} and dropping connection.",
+                        "Unexpected response from database. Sending errorocode and dropping Client-{}.",
                         id
                     );
                     send_data(&500_i32.to_le_bytes(), &stream);
@@ -391,7 +391,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
                 }
                 Err(e) => {
                     error!(
-                        "Failed to query database. Sending errorcode to Client-{} and dropping connection. {}",
+                        "Failed to query database. Sending errorocode and dropping Client-{}. {}",
                         id, e
                     );
                     send_data(&500_i32.to_le_bytes(), &stream);
@@ -423,7 +423,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
                     Ok(data) => {
                         if data.len() <= 12 {
                             warn!(
-                                "Client-{} data is too short (username must be at least 1b). Sending errorcode and dropping connection.",
+                                "Data is too short (username must be at least 1b). Sending errorcode and dropping Client-{}.",
                                 id
                             );
                             send_data(&401_i32.to_le_bytes(), &stream);
@@ -435,7 +435,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
                     }
                     Err(e) => {
                         warn!(
-                            "Failed to decrypt data. Sending errorcode to Client-{} and dropping connection. {}",
+                            "Failed to decrypt data. Sending errorocode and dropping Client-{}. {}",
                             id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
