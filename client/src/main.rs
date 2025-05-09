@@ -1,5 +1,5 @@
 use aes_gcm_siv::{
-    Aes256GcmSiv, Key, Nonce,
+    Aes256GcmSiv, AesGcmSiv, Key, Nonce,
     aead::{Aead, KeyInit, OsRng},
 };
 use console::Term;
@@ -28,24 +28,19 @@ fn main() {
     //resume_session(&stream);
 }
 
-fn new_session(stream: &TcpStream) {
-    let mut rng = OsRng;
-    debug!("New session requested");
+fn exchange_keys(stream: &TcpStream, identifier: u8) -> (Nonce, RsaPublicKey, Vec<u8>, usize) {
     trace!("Generating client secret... (Diffie-Hellman)");
     let client_secret = EphemeralSecret::random(&mut OsRng);
     let client_pk_bytes = EncodedPoint::from(client_secret.public_key());
     trace!("Initiating new session request with Diffie-Hellman handshake...");
-    let mut payload = vec![0];
+    let mut payload = vec![identifier];
     payload.extend_from_slice(client_pk_bytes.as_bytes());
     trace!("Sending client public key...");
     send_data(&payload, stream);
-    trace!("Requesting username...");
-    let username = request("Username: ", false);
-    let username = username.as_bytes();
     print!("Awaiting response from server\x1B[31m.\x1B[32m.\x1B[33m.\x1B[0m");
     io::stdout().flush().unwrap();
     trace!(
-        "Awaiting server public key (65b), decryptnonce (12b), and encrypted RSA-2048 public key..."
+        "Awaiting server public key (65b), decryptnonce (12b), encrypted RSA-2048 public key (?b) and descriminator (?b)..."
     );
     let payload = receive_data(stream);
     print!("\x1B[2K\r");
@@ -56,23 +51,43 @@ fn new_session(stream: &TcpStream) {
     trace!("Deriving public key...");
     let mut hasher = Sha3_256::new();
     hasher.update(shared_secret.raw_secret_bytes());
-    let key = &hasher.finalize();
+    let rawkeybytes = &hasher.finalize();
+    let key = &rawkeybytes;
     let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
     let cipher = Aes256GcmSiv::new(key);
     let decryptnonce = Nonce::from_slice(&payload[65..77]);
     let cleartext = cipher.decrypt(decryptnonce, &payload[77..]).unwrap();
-    let encryptnonce = Nonce::from_slice(&cleartext[0..12]);
+    let pkstart = u16::from_le_bytes([cleartext[14], cleartext[15]]) as usize;
     let public_key =
-        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext[12..])).unwrap();
+        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext[14..pkstart + 14]))
+            .unwrap();
+    (
+        *Nonce::from_slice(&cleartext[0..12]),
+        public_key,
+        rawkeybytes.to_vec(),
+        usize::from_le_bytes(cleartext[pkstart + 14..].try_into().unwrap()),
+    )
+}
+
+fn new_session(stream: &TcpStream) {
+    let mut rng = OsRng;
+    debug!("New session requested");
+    trace!("Requesting username...");
+    let username = request("Username: ", false);
+    let username = username.as_bytes();
+    let (encryptnonce, public_key, rawkeybytes, discriminator) = exchange_keys(stream, 0u8);
+    debug!("Session descriminator: {}", discriminator);
     trace!(
         "Sending decryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
     );
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(&rawkeybytes);
+    let cipher = Aes256GcmSiv::new(key);
     let mut decryptnonce = [0; 12];
     rng.try_fill_bytes(&mut decryptnonce).unwrap();
     let mut cleartext = Vec::new();
     cleartext.extend_from_slice(&decryptnonce);
     cleartext.extend_from_slice(username);
-    let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+    let ciphertext = cipher.encrypt(&encryptnonce, cleartext.as_ref()).unwrap();
     let payload = block_encrypt(&public_key, &ciphertext).unwrap();
     send_data(&payload, stream);
     let response = receive_data(stream);
@@ -119,15 +134,6 @@ fn new_session(stream: &TcpStream) {
 fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], nextnonce: &[u8]) {
     let mut rng = OsRng;
     debug!("Resume session requested.");
-    trace!("Generating client secret... (Diffie-Hellman)");
-    let client_secret = EphemeralSecret::random(&mut OsRng);
-    let client_pk_bytes = EncodedPoint::from(client_secret.public_key());
-    trace!("Initiating new session request with Diffie-Hellman handshake...");
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&[1u8]);
-    payload.extend_from_slice(client_pk_bytes.as_bytes());
-    trace!("Sending client public key...");
-    send_data(&payload, stream);
     let username = match usernameraw {
         Some(username) => username.to_vec(),
         None => {
@@ -135,28 +141,13 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
             request("Username: ", false).into_bytes()
         }
     };
-    print!("Awaiting response from server\x1B[31m.\x1B[32m.\x1B[33m.\x1B[0m");
-    io::stdout().flush().unwrap();
+    let (mut encryptnonce, public_key, rawkeybytes, discriminator) = exchange_keys(stream, 1u8);
+    debug!("Session descriminator: {}", discriminator);
     trace!(
-        "Awaiting server public key (65b), decryptnonce (12b), and encrypted RSA-2048 public key..."
+        "Sending decryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
     );
-    let payload = receive_data(stream);
-    print!("\x1B[2K\r");
-    let server_public =
-        PublicKey::from_sec1_bytes(&payload[0..65]).expect("Invalid server public key!");
-    let shared_secret = client_secret.diffie_hellman(&server_public);
-    trace!("Shared secret derived!");
-    trace!("Deriving public key...");
-    let mut hasher = Sha3_256::new();
-    hasher.update(shared_secret.raw_secret_bytes());
-    let key = &hasher.finalize();
-    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(&rawkeybytes);
     let cipher = Aes256GcmSiv::new(key);
-    let decryptnonce = Nonce::from_slice(&payload[65..77]);
-    let cleartext = cipher.decrypt(decryptnonce, &payload[77..]).unwrap();
-    let mut encryptnonce = Nonce::from_slice(&cleartext[0..12]);
-    let public_key =
-        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext[12..])).unwrap();
     trace!(
         "Sending decryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
     );
@@ -165,7 +156,7 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
     let mut cleartext = Vec::new();
     cleartext.extend_from_slice(&decryptnonce);
     cleartext.extend_from_slice(&username);
-    let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+    let ciphertext = cipher.encrypt(&encryptnonce, cleartext.as_ref()).unwrap();
     let payload = block_encrypt(&public_key, &ciphertext).unwrap();
     send_data(&payload, stream);
     let mut hasher = Sha3_256::new();
@@ -183,7 +174,7 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
         let rawdata = cipher
             .decrypt(Nonce::from_slice(&decryptnonce), response.as_ref())
             .unwrap();
-        encryptnonce = Nonce::from_slice(&rawdata[..12]);
+        encryptnonce = *Nonce::from_slice(&rawdata[..12]);
         let num1 = u64::from_le_bytes(rawdata[12..20].try_into().unwrap());
         let num2 = u64::from_le_bytes(rawdata[20..28].try_into().unwrap());
         let sum = num1 ^ num2;
@@ -191,7 +182,7 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
         let mut data = Vec::new();
         data.extend_from_slice(&decryptnonce);
         data.extend_from_slice(&sum.to_le_bytes());
-        let payload = cipher.encrypt(encryptnonce, data.as_ref()).unwrap();
+        let payload = cipher.encrypt(&encryptnonce, data.as_ref()).unwrap();
         trace!("returning XOR result... ");
         send_data(&payload, stream);
     }
@@ -229,15 +220,6 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> Vec<u8> {
     let password = ClearTextPassword::from(request("Password: ", true));
     let mut rng = OsRng;
     debug!("Login session requested.");
-    trace!("Generating client secret... (Diffie-Hellman)");
-    let client_secret = EphemeralSecret::random(&mut OsRng);
-    let client_pk_bytes = EncodedPoint::from(client_secret.public_key());
-    trace!("Initiating new session request with Diffie-Hellman handshake...");
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&[2u8]);
-    payload.extend_from_slice(client_pk_bytes.as_bytes());
-    trace!("Sending client public key...");
-    send_data(&payload, stream);
     let username = match usernameraw {
         Some(username) => username.to_vec(),
         None => {
@@ -245,28 +227,13 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> Vec<u8> {
             request("Username: ", false).into_bytes()
         }
     };
-    print!("Awaiting response from server\x1B[31m.\x1B[32m.\x1B[33m.\x1B[0m");
-    io::stdout().flush().unwrap();
+    let (encryptnonce, public_key, rawkeybytes, discriminator) = exchange_keys(stream, 2u8);
+    debug!("Session descriminator: {}", discriminator);
     trace!(
-        "Awaiting server public key (65b), decryptnonce (12b), and encrypted RSA-2048 public key..."
+        "Sending decryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
     );
-    let payload = receive_data(stream);
-    print!("\x1B[2K\r");
-    let server_public =
-        PublicKey::from_sec1_bytes(&payload[0..65]).expect("Invalid server public key!");
-    let shared_secret = client_secret.diffie_hellman(&server_public);
-    trace!("Shared secret derived!");
-    trace!("Deriving public key...");
-    let mut hasher = Sha3_256::new();
-    hasher.update(shared_secret.raw_secret_bytes());
-    let key = &hasher.finalize();
-    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(&rawkeybytes);
     let cipher = Aes256GcmSiv::new(key);
-    let decryptnonce = Nonce::from_slice(&payload[65..77]);
-    let cleartext = cipher.decrypt(decryptnonce, &payload[77..]).unwrap();
-    let encryptnonce = Nonce::from_slice(&cleartext[0..12]);
-    let public_key =
-        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext[12..])).unwrap();
     trace!(
         "Sending decryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
     );
@@ -275,7 +242,7 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> Vec<u8> {
     let mut cleartext = Vec::new();
     cleartext.extend_from_slice(&decryptnonce);
     cleartext.extend_from_slice(&username);
-    let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+    let ciphertext = cipher.encrypt(&encryptnonce, cleartext.as_ref()).unwrap();
     let payload = block_encrypt(&public_key, &ciphertext).unwrap();
     send_data(&payload, stream);
     trace!("Awaiting handshake from server...");

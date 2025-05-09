@@ -97,7 +97,7 @@ async fn main() {
     let port = retreive_config("PORT").parse::<u16>().unwrap_or(15496);
     let listener = TcpListener::bind("127.0.0.1:".to_owned() + &port.to_string()).unwrap();
     info!("Server listening on 127.0.0.1:{}", port);
-    let mut connid = 0u128;
+    let mut connid = 0usize;
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -119,7 +119,7 @@ async fn main() {
     }
 }
 
-async fn handle_connection(stream: TcpStream, id: u128) {
+async fn handle_connection(stream: TcpStream, id: usize) {
     let mut rng = OsRng;
     let parsed_data = parse_data(&receive_data(&stream));
     if parsed_data.indentifier == 0 {
@@ -165,20 +165,20 @@ async fn handle_connection(stream: TcpStream, id: u128) {
     let mut cleartext = Vec::new();
     let mut decryptnonce = [0u8; 12];
     rng.try_fill_bytes(&mut decryptnonce).unwrap();
+    let pubkeybytes = public_key
+        .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+        .unwrap();
+    let pklen = pubkeybytes.len() as u16;
     cleartext.extend_from_slice(&decryptnonce);
-    cleartext.extend_from_slice(
-        public_key
-            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
-            .unwrap()
-            .as_ref(),
-    );
+    cleartext.extend_from_slice(&pklen.to_le_bytes());
+    cleartext.extend_from_slice(pubkeybytes.as_ref());
     let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
     let mut payload = Vec::new();
     payload.extend_from_slice(server_pk_bytes.as_bytes());
     payload.extend_from_slice(encryptnonce);
     payload.extend_from_slice(&ciphertext);
     trace!(
-        "Sending server public key (65b), encryptnonce (12b), and encrypted RSA-2048 key from Client-{}...",
+        "Sending server public key (65b), encryptnonce (12b), encrypted RSA-2048 key for Client-{} (?b) and descriminator (?b)...",
         id
     );
     send_data(&payload, &stream);
@@ -478,7 +478,7 @@ async fn handle_connection(stream: TcpStream, id: u128) {
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
-fn generate_keys(id: u128) -> (RsaPrivateKey, RsaPublicKey) {
+fn generate_keys(id: usize) -> (RsaPrivateKey, RsaPublicKey) {
     let bits = retreive_config("BITS").parse::<usize>().unwrap_or(2048);
     trace!("Generating keys for Client-{}...", id);
     let mut rng = OsRng;
@@ -525,7 +525,7 @@ async fn srp6_register(
     salt: &[u8],
     verifier: &[u8],
     decryptnonce: &[u8],
-    id: u128,
+    id: usize,
 ) -> Vec<u8> {
     let mut rng = OsRng;
     let mut magic = [0u8; 255];
@@ -608,7 +608,7 @@ async fn srp6_register(
     magic.to_vec()
 }
 
-async fn get_user_details(username: &[u8], pool: &MySqlPool, id: u128) -> UserSecrets {
+async fn get_user_details(username: &[u8], pool: &MySqlPool, id: usize) -> UserSecrets {
     match sqlx::query!(
         "SELECT salt, verifier FROM users WHERE username = ?",
         username
