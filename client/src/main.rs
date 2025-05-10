@@ -1,5 +1,5 @@
 use aes_gcm_siv::{
-    Aes256GcmSiv, Key, Nonce,
+    Aes256GcmSiv, AesGcmSiv, Key, Nonce,
     aead::{Aead, KeyInit, OsRng},
 };
 use console::Term;
@@ -165,9 +165,7 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
     );
     let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(&rawkeybytes);
     let cipher = Aes256GcmSiv::new(key);
-    trace!(
-        "Sending decryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
-    );
+
     let mut decryptnonce = [0; 12];
     let _ = rng.try_fill_bytes(&mut decryptnonce);
     let mut cleartext = Vec::new();
@@ -250,9 +248,16 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> Vec<u8> {
     );
     let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(&rawkeybytes);
     let cipher = Aes256GcmSiv::new(key);
+    let decryptnonce = Nonce::from_slice(&payload[65..77]);
+    let cleartext = cipher.decrypt(decryptnonce, &payload[77..]).unwrap();
+    let encryptnonce = Nonce::from_slice(&cleartext[0..12]);
+    let public_key =
+        RsaPublicKey::from_public_key_pem(&String::from_utf8_lossy(&cleartext[12..])).unwrap();
     trace!(
         "Sending decryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
     );
+    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(&rawkeybytes);
+    let cipher = Aes256GcmSiv::new(key);
     let mut decryptnonce = [0; 12];
     rng.try_fill_bytes(&mut decryptnonce).unwrap();
     let mut cleartext = Vec::new();
