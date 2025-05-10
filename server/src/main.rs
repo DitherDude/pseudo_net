@@ -480,9 +480,106 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             send_data(b"session resumed!", &stream);
         }
         2 => {
+            let encryptnonce = Nonce::from_slice(&cleartext[..12]);
             let srp = Srp6_4096::default();
-            let (handshake, _proof_verifier) =
+            let (handshake, proof_verifier) =
                 srp.start_handshake(&get_user_details(username, &pool, id).await);
+            trace!("Sending serialized handshake to Client-{}...", id);
+            let serialized = serde_json::to_vec(&handshake).unwrap();
+            let _ = rng.try_fill_bytes(&mut decryptnonce);
+            let mut cleartext = Vec::new();
+            cleartext.extend_from_slice(&decryptnonce);
+            cleartext.extend_from_slice(&serialized);
+            let data = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+            //let data = block_decrypt(&private_key, &serialized).unwrap();
+            send_data(&data, &stream);
+            trace!("Awaiting proof from Client-{}...", id);
+            let response = receive_data(&stream);
+            let ciphertext = block_decrypt(&private_key, &response).unwrap();
+            let data = match cipher.decrypt(Nonce::from_slice(&decryptnonce), &ciphertext[..]) {
+                Ok(data) => {
+                    if data.len() <= 12 {
+                        warn!(
+                            "Data is too short (proof must be at least 1b). Sending errorcode and dropping Client-{}.",
+                            id
+                        );
+                        send_data(&401_i32.to_le_bytes(), &stream);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    } else {
+                        data
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to decrypt data. Sending errorocode and dropping Client-{}. {}",
+                        id, e
+                    );
+                    send_data(&400_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            };
+            let encryptnonce = Nonce::from_slice(&data[..12]);
+            let proof = data[12..].to_vec();
+            let proof: HandshakeProof<512, 512> = match serde_json::from_slice(&proof) {
+                Ok(proof) => proof,
+                Err(e) => {
+                    warn!(
+                        "Failed to deserialize proof. Sending vague errorcode and dropping Client-{}. {}",
+                        id, e
+                    );
+                    send_data(&501_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            };
+            let (strong_proof, _session_key_server) = match proof_verifier.verify_proof(&proof) {
+                Ok(proof) => proof,
+                Err(e) => {
+                    warn!(
+                        "Failed to verify proof. Sending vague errorcode and dropping Client-{}. {}",
+                        id, e
+                    );
+                    send_data(&501_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            };
+            trace!("Sending strong proof to Client-{}...", id);
+            let serialized = serde_json::to_vec(&strong_proof).unwrap();
+            let _ = rng.try_fill_bytes(&mut decryptnonce);
+            let mut cleartext = Vec::new();
+            cleartext.extend_from_slice(&decryptnonce);
+            cleartext.extend_from_slice(&serialized);
+            let data = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+            send_data(&data, &stream);
+            let mut hasher = Sha3_256::new();
+            hasher.update(strong_proof.to_vec());
+            let magic = hasher.finalize();
+            match sqlx::query!(
+                r#"UPDATE users
+                SET nonce = ?,
+                magic = ?
+                WHERE username = ?"#,
+                &decryptnonce[..],
+                &magic[..],
+                &username[..],
+            )
+            .execute(&pool)
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    error!(
+                        "Failed to query database. Sending errorcode and dropping Client-{}. {}",
+                        id, e
+                    );
+                    send_data(&500_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            };
         }
         _ => {}
     }

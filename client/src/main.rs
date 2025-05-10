@@ -1,5 +1,5 @@
 use aes_gcm_siv::{
-    Aes256GcmSiv, AesGcmSiv, Key, Nonce,
+    Aes256GcmSiv, Key, Nonce,
     aead::{Aead, KeyInit, OsRng},
 };
 use console::Term;
@@ -143,9 +143,15 @@ fn new_session(stream: &TcpStream) {
             magic,
             encryptnonce,
         );
-        //println!("magic: {:?}, nextnonce: {:?}", magic, encryptnonce);
     } else {
-        login(&TcpStream::connect(&serverip).unwrap(), Some(username));
+        let (magic, encryptnonce, username) =
+            login(&TcpStream::connect(&serverip).unwrap(), Some(username));
+        resume_session(
+            &TcpStream::connect(&serverip).unwrap(),
+            Some(&username),
+            &magic,
+            &encryptnonce,
+        );
     };
 }
 
@@ -231,7 +237,7 @@ fn salt_verifier(username: &[u8]) -> Vec<u8> {
     payload
 }
 
-fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> Vec<u8> {
+fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let password = ClearTextPassword::from(request("Password: ", true));
     let mut rng = OsRng;
     debug!("Login session requested.");
@@ -260,7 +266,38 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> Vec<u8> {
     let payload = block_encrypt(&public_key, &ciphertext).unwrap();
     send_data(&payload, stream);
     trace!("Awaiting handshake from server...");
-    Vec::new()
+    let response = receive_data(stream);
+    let cleartext = cipher
+        .decrypt(Nonce::from_slice(&decryptnonce), response.as_ref())
+        .unwrap();
+    let encryptnonce = Nonce::from_slice(&cleartext[..12]);
+    let handshake: Handshake<512, 512> = serde_json::from_slice(&cleartext[12..]).unwrap();
+    let (proof, strong_proof_verifier) = handshake
+        .calculate_proof(&String::from_utf8_lossy(&username), &password)
+        .unwrap();
+    trace!("Sending proof to server...");
+    let serialized = serde_json::to_vec(&proof).unwrap();
+    let _ = rng.try_fill_bytes(&mut decryptnonce);
+    let mut cleartext = Vec::new();
+    cleartext.extend_from_slice(&decryptnonce);
+    cleartext.extend_from_slice(&serialized);
+    let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+    let payload = block_encrypt(&public_key, &ciphertext).unwrap();
+    send_data(&payload, stream);
+    trace!("Awaiting strong proof from server...");
+    let response = receive_data(stream);
+    let cleartext = cipher
+        .decrypt(Nonce::from_slice(&decryptnonce), response.as_ref())
+        .unwrap();
+    let encryptnonce = &cleartext[..12];
+    let strong_proof: BigNumber = serde_json::from_slice(&cleartext[12..]).unwrap();
+    strong_proof_verifier
+        .verify_strong_proof(&strong_proof)
+        .unwrap();
+    let mut hasher = Sha3_256::new();
+    hasher.update(strong_proof.to_vec());
+    let magic = hasher.finalize();
+    (magic.to_vec(), encryptnonce.to_vec(), username)
 }
 
 fn request(prompt: &str, password: bool) -> String {

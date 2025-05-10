@@ -8,6 +8,7 @@ aes-gcm-siv.workspace = true
 console.workspace = true
 p256.workspace = true
 rsa.workspace = true
+serde_json.workspace = true
 sha3.workspace = true
 srp6.workspace = true
 tracing.workspace = true
