@@ -22,6 +22,7 @@ fn main() {
         .unwrap_or("info".to_string())
         .as_str()
     {
+        "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
         "info" => Level::INFO,
         "warn" => Level::WARN,

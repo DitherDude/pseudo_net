@@ -24,6 +24,7 @@ async fn main() {
         .unwrap_or("info".to_string())
         .as_str()
     {
+        "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
         "info" => Level::INFO,
         "warn" => Level::WARN,
@@ -137,7 +138,13 @@ async fn main() {
 
 async fn handle_connection(stream: TcpStream, id: usize) {
     let mut rng = OsRng;
-    let parsed_data = parse_data(&receive_data(&stream));
+    let parsed_data = match parse_data(&receive_data(&stream)) {
+        Ok(data) => data,
+        Err(_) => {
+            trace!("Client disappeared... Whoosh!");
+            return;
+        }
+    };
     if parsed_data.indentifier == 0 {
         trace!(
             "Client-{} new session request. Initiating Diffie-Hellman handshake...",
@@ -607,11 +614,17 @@ struct DataParser {
     payload: Vec<u8>,
 }
 
-fn parse_data(data: &[u8]) -> DataParser {
-    DataParser {
+fn parse_data(data: &[u8]) -> Result<DataParser, &'static str> {
+    if data.is_empty() {
+        return Err("Data is empty");
+    }
+    if data.len() < 2 {
+        return Err("Data length is less than 2");
+    }
+    Ok(DataParser {
         indentifier: data[0],
         payload: data[1..].to_vec(),
-    }
+    })
 }
 
 fn retreive_config(path: &str) -> String {
