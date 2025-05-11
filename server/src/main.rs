@@ -1,5 +1,9 @@
-use aes_gcm_siv::{
-    Aes256GcmSiv, Key, Nonce,
+// use aes_gcm_siv::{
+//     Aes256GcmSiv, Key, Nonce,
+//     aead::{Aead, KeyInit, OsRng},
+// };
+use chacha20poly1305::{
+    XChaCha20Poly1305,
     aead::{Aead, KeyInit, OsRng},
 };
 use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret};
@@ -180,13 +184,12 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     let mut hasher = Sha3_256::new();
     hasher.update(shared_secret.raw_secret_bytes());
     let key = &hasher.finalize();
-    let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
-    let cipher = Aes256GcmSiv::new(key);
-    let mut encryptnonce = [0u8; 12];
+    let cipher = XChaCha20Poly1305::new(key);
+    let mut encryptnonce: [u8; 24] = [0u8; 24];
     rng.try_fill_bytes(&mut encryptnonce).unwrap();
-    let encryptnonce = Nonce::from_slice(&encryptnonce);
+    //let encryptnonce = Nonce::from_slice(&encryptnonce);
     let mut cleartext = Vec::new();
-    let mut decryptnonce = [0u8; 12];
+    let mut decryptnonce = [0u8; 24];
     rng.try_fill_bytes(&mut decryptnonce).unwrap();
     let pubkeybytes = public_key
         .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
@@ -196,18 +199,20 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     cleartext.extend_from_slice(&pklen.to_le_bytes());
     cleartext.extend_from_slice(pubkeybytes.as_ref());
     cleartext.extend_from_slice(&id.to_le_bytes());
-    let ciphertext = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+    let ciphertext = cipher
+        .encrypt(&encryptnonce.into(), cleartext.as_ref())
+        .unwrap();
     let mut payload = Vec::new();
     payload.extend_from_slice(server_pk_bytes.as_bytes());
-    payload.extend_from_slice(encryptnonce);
+    payload.extend_from_slice(&encryptnonce);
     payload.extend_from_slice(&ciphertext);
     trace!(
-        "Sending server public key (65b), encryptnonce (12b), encrypted RSA-2048 key for Client-{} (?b) and descriminator (?b)...",
+        "Sending server public key (65b), encryptnonce (24b), encrypted RSA-2048 key for Client-{} (?b) and descriminator (?b)...",
         id
     );
     send_data(&payload, &stream);
     trace!(
-        "Awaiting encryptnonce (12b) + username (?b) encryped via shared secret through the RSA-2048 public key from Client-{}...",
+        "Awaiting encryptnonce (24b) + username (?b) encryped via shared secret through the RSA-2048 public key from Client-{}...",
         id
     );
     let payload = receive_data(&stream);
@@ -223,9 +228,9 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             return;
         }
     };
-    let cleartext = match cipher.decrypt(Nonce::from_slice(&decryptnonce), &ciphertext[..]) {
+    let cleartext = match cipher.decrypt(&decryptnonce.into(), &ciphertext[..]) {
         Ok(data) => {
-            if data.len() <= 12 {
+            if data.len() <= 24 {
                 warn!(
                     "Data is too short (username must be at least 1b). Sending errorcode and dropping Client-{}.",
                     id
@@ -233,7 +238,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 send_data(&401_i32.to_le_bytes(), &stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
-            } else if data.len() > 267 {
+            } else if data.len() > 279 {
                 warn!(
                     "Data is too long (username must be less than 255b). Sending errorcode and dropping Client-{}.",
                     id
@@ -259,9 +264,9 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     trace!(
         "Checking if Client-{}'s requested user \"{:?}\" exists.",
         id,
-        &cleartext[12..]
+        &cleartext[24..]
     );
-    let username = &cleartext[12..];
+    let username = &cleartext[24..];
     let userexists = match sqlx::query!(
         r#"SELECT COUNT(*) as count FROM users WHERE username = ?"#,
         &username
@@ -292,7 +297,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     if userexists > 2 {
         warn!(
             "Invalid count of occurances for user {:?}! Sending errorocode and dropping Client-{}.",
-            &cleartext[12..],
+            &cleartext[24..],
             id
         );
         send_data(&500_i32.to_le_bytes(), &stream);
@@ -301,15 +306,17 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     }
     match parsed_data.indentifier {
         0 => {
-            let encryptnonce = Nonce::from_slice(&cleartext[..12]);
+            let encryptnonce = &cleartext[..24];
             rng.try_fill_bytes(&mut decryptnonce).unwrap();
             let mut cleartext = Vec::new();
             cleartext.extend_from_slice(&decryptnonce);
             cleartext.extend_from_slice(&userexists.to_le_bytes());
-            let payload = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+            let payload = cipher
+                .encrypt(encryptnonce.into(), cleartext.as_ref())
+                .unwrap();
             send_data(&payload, &stream);
             if userexists == 1 {
-                //login(&cleartext[12..])
+                //login(&cleartext[24..])
             } else {
                 let response = receive_data(&stream);
                 let ciphertext = match block_decrypt(&private_key, &response) {
@@ -324,9 +331,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         return;
                     }
                 };
-                let payload = match cipher
-                    .decrypt(Nonce::from_slice(&decryptnonce), &ciphertext[..])
-                {
+                let payload = match cipher.decrypt(&decryptnonce.into(), &ciphertext[..]) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!(
@@ -338,10 +343,10 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         return;
                     }
                 };
-                match payload.len().cmp(&1036) {
+                match payload.len().cmp(&1048) {
                     Less => {
                         warn!(
-                            "Data is too short (expecting 1036b). Sending errorcode and dropping Client-{}.",
+                            "Data is too short (expecting 1048b). Sending errorcode and dropping Client-{}.",
                             id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
@@ -350,7 +355,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     }
                     Greater => {
                         warn!(
-                            "Data is too long (expecting 1036b). Sending errorcode and dropping Client-{}.",
+                            "Data is too long (expecting 1048b). Sending errorcode and dropping Client-{}.",
                             id
                         );
                         send_data(&402_i32.to_le_bytes(), &stream);
@@ -358,9 +363,9 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         return;
                     }
                     Equal => {
-                        let encryptnonce = &payload[..12];
-                        let salt = &payload[12..524];
-                        let verifier = &payload[524..1036];
+                        let encryptnonce = &payload[..24];
+                        let salt = &payload[24..536];
+                        let verifier = &payload[536..1048];
                         rng.try_fill_bytes(&mut decryptnonce).unwrap();
                         let mut plaintext = Vec::new();
                         plaintext.extend_from_slice(&decryptnonce);
@@ -377,7 +382,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             .await,
                         );
                         let data = cipher
-                            .encrypt(Nonce::from_slice(encryptnonce), plaintext.as_ref())
+                            .encrypt(encryptnonce.into(), plaintext.as_ref())
                             .unwrap();
                         send_data(&data, &stream);
                     }
@@ -399,7 +404,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         fluff.to_vec()
                     }),
                     data.nonce.unwrap_or_else(|| {
-                        let mut fluff = [0; 12];
+                        let mut fluff = [0u8; 24];
                         let _ = rng.try_fill_bytes(&mut fluff);
                         fluff.to_vec()
                     }),
@@ -426,26 +431,25 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let mut hasher = Sha3_256::new();
             hasher.update(magic);
             let key = &hasher.finalize();
-            let key: &Key<Aes256GcmSiv> = GenericArray::from_slice(key);
-            let cipher = Aes256GcmSiv::new(key);
+            let cipher = XChaCha20Poly1305::new(key);
             let mut failed = false;
             for i in 0..7 {
                 let num1 = rand_core::RngCore::next_u64(&mut OsRng);
                 let num2 = rand_core::RngCore::next_u64(&mut OsRng);
-                let mut decryptnonce = [0; 12];
+                let mut decryptnonce = [0u8; 24];
                 rng.try_fill_bytes(&mut decryptnonce).unwrap();
                 let mut cleartext = Vec::new();
                 cleartext.extend_from_slice(&decryptnonce);
                 cleartext.extend_from_slice(&num1.to_le_bytes());
                 cleartext.extend_from_slice(&num2.to_le_bytes());
                 let data = cipher
-                    .encrypt(Nonce::from_slice(&encryptnonce), cleartext.as_ref())
+                    .encrypt(GenericArray::from_slice(&encryptnonce), cleartext.as_ref())
                     .unwrap();
                 send_data(&data, &stream);
                 let response = receive_data(&stream);
-                let data = match cipher.decrypt(Nonce::from_slice(&decryptnonce), &response[..]) {
+                let data = match cipher.decrypt(&decryptnonce.into(), &response[..]) {
                     Ok(data) => {
-                        if data.len() <= 12 {
+                        if data.len() <= 24 {
                             warn!(
                                 "Data is too short (username must be at least 1b). Sending errorcode and dropping Client-{}.",
                                 id
@@ -467,8 +471,8 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         return;
                     }
                 };
-                let nextnonce = &data[..12];
-                if data[12..].to_vec() != (num1 ^ num2).to_le_bytes().to_vec() {
+                let nextnonce = &data[..24];
+                if data[24..].to_vec() != (num1 ^ num2).to_le_bytes().to_vec() {
                     warn!("Client-{} failed verification round {}/7", id, i);
                     failed = true;
                 }
@@ -487,7 +491,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             send_data(b"session resumed!", &stream);
         }
         2 => {
-            let encryptnonce = Nonce::from_slice(&cleartext[..12]);
+            let encryptnonce = &cleartext[..24];
             let srp = Srp6_4096::default();
             let (handshake, proof_verifier) =
                 srp.start_handshake(&get_user_details(username, &pool, id).await);
@@ -497,15 +501,17 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let mut cleartext = Vec::new();
             cleartext.extend_from_slice(&decryptnonce);
             cleartext.extend_from_slice(&serialized);
-            let data = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+            let data = cipher
+                .encrypt(encryptnonce.into(), cleartext.as_ref())
+                .unwrap();
             //let data = block_decrypt(&private_key, &serialized).unwrap();
             send_data(&data, &stream);
             trace!("Awaiting proof from Client-{}...", id);
             let response = receive_data(&stream);
             let ciphertext = block_decrypt(&private_key, &response).unwrap();
-            let data = match cipher.decrypt(Nonce::from_slice(&decryptnonce), &ciphertext[..]) {
+            let data = match cipher.decrypt(&decryptnonce.into(), &ciphertext[..]) {
                 Ok(data) => {
-                    if data.len() <= 12 {
+                    if data.len() <= 24 {
                         warn!(
                             "Data is too short (proof must be at least 1b). Sending errorcode and dropping Client-{}.",
                             id
@@ -527,8 +533,8 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     return;
                 }
             };
-            let encryptnonce = Nonce::from_slice(&data[..12]);
-            let proof = data[12..].to_vec();
+            let encryptnonce = &data[..24];
+            let proof = data[24..].to_vec();
             let proof: HandshakeProof<512, 512> = match serde_json::from_slice(&proof) {
                 Ok(proof) => proof,
                 Err(e) => {
@@ -559,7 +565,9 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let mut cleartext = Vec::new();
             cleartext.extend_from_slice(&decryptnonce);
             cleartext.extend_from_slice(&serialized);
-            let data = cipher.encrypt(encryptnonce, cleartext.as_ref()).unwrap();
+            let data = cipher
+                .encrypt(encryptnonce.into(), cleartext.as_ref())
+                .unwrap();
             send_data(&data, &stream);
             let mut hasher = Sha3_256::new();
             hasher.update(strong_proof.to_vec());

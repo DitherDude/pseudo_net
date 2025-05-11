@@ -1,4 +1,3 @@
-use aes_gcm_siv::aead::OsRng;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};
 use std::{
     io::{Read, Write},
@@ -74,7 +73,7 @@ pub fn block_encrypt(key: &RsaPublicKey, data: &[u8]) -> Result<Vec<u8>, rsa::Er
     let chunk_by = key.size() - 11;
     let mut payload = Vec::new();
     for chunk in data.chunks(chunk_by) {
-        payload.extend(key.encrypt(&mut OsRng, Pkcs1v15Encrypt, chunk)?);
+        payload.extend(key.encrypt(&mut chacha20poly1305::aead::OsRng, Pkcs1v15Encrypt, chunk)?);
     }
     Ok(payload)
 }

@@ -5,8 +5,9 @@ edition = "2024"
 default-run = "server"
 
 [dependencies]
-aes-gcm-siv.workspace = true
+#aes-gcm-siv.workspace = true
 async-std.workspace = true
+chacha20poly1305.workspace = true
 p256.workspace = true
 rsa.workspace = true
 serde_json.workspace = true
