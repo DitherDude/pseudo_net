@@ -57,12 +57,12 @@ fn exchange_keys(stream: &TcpStream, identifier: u8) -> (Vec<u8>, RsaPublicKey, 
     print!("Awaiting response from server\x1B[31m.\x1B[32m.\x1B[33m.\x1B[0m");
     io::stdout().flush().unwrap();
     trace!(
-        "Awaiting server public key (65b), decryptnonce (24b), encrypted RSA-2048 public key (?b) and descriminator (?b)..."
+        "Awaiting server public key (65b), decryptnonce (24b), encrypted RSA public key (?b) and descriminator (?b)..."
     );
     let payload = receive_data(stream);
     print!("\x1B[2K\r");
     let server_public =
-        PublicKey::from_sec1_bytes(&payload[0..65]).expect("Invalid server public key!");
+        PublicKey::from_sec1_bytes(&payload[..65]).expect("Invalid server public key!");
     let shared_secret = client_secret.diffie_hellman(&server_public);
     trace!("Shared secret derived!");
     trace!("Deriving public key...");
@@ -93,7 +93,7 @@ fn new_session(stream: &TcpStream) {
     let username = username.as_bytes();
     let (encryptnonce, public_key, rawkeybytes) = exchange_keys(stream, 0u8);
     trace!(
-        "Sending decryptnonce (24b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
+        "Sending decryptnonce (24b) + username (?b) encryped via shared secret through the RSA public key..."
     );
     let key = GenericArray::from_slice(&rawkeybytes);
     let cipher = XChaCha20Poly1305::new(key);
@@ -170,7 +170,7 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
     let cipher = XChaCha20Poly1305::new(key);
 
     let mut decryptnonce = [0u8; 24];
-    let _ = rng.try_fill_bytes(&mut decryptnonce);
+    rng.try_fill_bytes(&mut decryptnonce).unwrap();
     let mut cleartext = Vec::new();
     cleartext.extend_from_slice(&decryptnonce);
     cleartext.extend_from_slice(&username);
@@ -186,7 +186,7 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
     let cipher = XChaCha20Poly1305::new(key);
     decryptnonce = nextnonce.try_into().unwrap();
     for i in 0..7 {
-        trace!("Awaiting sum from server ({}/7)...", i);
+        trace!("Awaiting sum from server ({}/7)...", i + 1);
         let response = receive_data(stream);
         if response.len() == 4 {
             error_decode(&response);
@@ -198,7 +198,7 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
         let num1 = u64::from_le_bytes(rawdata[24..32].try_into().unwrap());
         let num2 = u64::from_le_bytes(rawdata[32..40].try_into().unwrap());
         let sum = num1 ^ num2;
-        let _ = rng.try_fill_bytes(&mut decryptnonce);
+        rng.try_fill_bytes(&mut decryptnonce).unwrap();
         let mut data = Vec::new();
         data.extend_from_slice(&decryptnonce);
         data.extend_from_slice(&sum.to_le_bytes());
@@ -251,7 +251,7 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> (Vec<u8>, Vec<u8>, V
     };
     let (encryptnonce, public_key, rawkeybytes) = exchange_keys(stream, 2u8);
     trace!(
-        "Sending decryptnonce (14b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
+        "Sending decryptnonce (14b) + username (?b) encryped via shared secret through the RSA public key..."
     );
     let key = GenericArray::from_slice(&rawkeybytes);
     let cipher = XChaCha20Poly1305::new(key);
@@ -277,7 +277,7 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> (Vec<u8>, Vec<u8>, V
         .unwrap();
     trace!("Sending proof to server...");
     let serialized = serde_json::to_vec(&proof).unwrap();
-    let _ = rng.try_fill_bytes(&mut decryptnonce);
+    rng.try_fill_bytes(&mut decryptnonce).unwrap();
     let mut cleartext = Vec::new();
     cleartext.extend_from_slice(&decryptnonce);
     cleartext.extend_from_slice(&serialized);

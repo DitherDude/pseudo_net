@@ -26,7 +26,7 @@ pub fn receive_data(mut stream: &TcpStream) -> Vec<u8> {
         let start = data.len();
         data.extend(std::iter::repeat_n(0, len as usize));
         stream.read_exact(&mut data[start..]).unwrap();
-        trace!("Received data: {}", data.len() - start);
+        trace!("Received block of size {}.", data.len() - start);
         if len != u16::MAX {
             break;
         }

@@ -170,7 +170,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
         Ok(data) => data,
         Err(e) => {
             warn!("Failed to decode client-{} public key: {}", id, e);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
             return;
         }
     };
@@ -207,12 +207,12 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     payload.extend_from_slice(&encryptnonce);
     payload.extend_from_slice(&ciphertext);
     trace!(
-        "Sending server public key (65b), encryptnonce (24b), encrypted RSA-2048 key for Client-{} (?b) and descriminator (?b)...",
+        "Sending server public key (65b), encryptnonce (24b), encrypted RSA key for Client-{} (?b) and descriminator (?b)...",
         id
     );
     send_data(&payload, &stream);
     trace!(
-        "Awaiting encryptnonce (24b) + username (?b) encryped via shared secret through the RSA-2048 public key from Client-{}...",
+        "Awaiting encryptnonce (24b) + username (?b) encryped via shared secret through the RSA public key from Client-{}...",
         id
     );
     let payload = receive_data(&stream);
@@ -224,7 +224,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 id, e
             );
             send_data(&400_i32.to_le_bytes(), &stream);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
             return;
         }
     };
@@ -236,7 +236,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     id
                 );
                 send_data(&401_i32.to_le_bytes(), &stream);
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
                 return;
             } else if data.len() > 279 {
                 warn!(
@@ -244,7 +244,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     id
                 );
                 send_data(&402_i32.to_le_bytes(), &stream);
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
                 return;
             } else {
                 data
@@ -256,7 +256,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 id, e
             );
             send_data(&400_i32.to_le_bytes(), &stream);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
             return;
         }
     };
@@ -281,7 +281,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 id
             );
             send_data(&500_i32.to_le_bytes(), &stream);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
             return;
         }
         Err(e) => {
@@ -290,7 +290,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 id, e
             );
             send_data(&500_i32.to_le_bytes(), &stream);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
             return;
         }
     };
@@ -301,7 +301,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             id
         );
         send_data(&500_i32.to_le_bytes(), &stream);
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
         return;
     }
     match parsed_data.indentifier {
@@ -327,7 +327,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        stream.shutdown(std::net::Shutdown::Both).unwrap();
                         return;
                     }
                 };
@@ -339,7 +339,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        stream.shutdown(std::net::Shutdown::Both).unwrap();
                         return;
                     }
                 };
@@ -350,7 +350,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        stream.shutdown(std::net::Shutdown::Both).unwrap();
                         return;
                     }
                     Greater => {
@@ -359,7 +359,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id
                         );
                         send_data(&402_i32.to_le_bytes(), &stream);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        stream.shutdown(std::net::Shutdown::Both).unwrap();
                         return;
                     }
                     Equal => {
@@ -400,12 +400,12 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 Ok(Some(data)) => (
                     data.magic.unwrap_or_else(|| {
                         let mut fluff = [0; 255];
-                        let _ = rng.try_fill_bytes(&mut fluff);
+                        rng.try_fill_bytes(&mut fluff).unwrap();
                         fluff.to_vec()
                     }),
                     data.nonce.unwrap_or_else(|| {
                         let mut fluff = [0u8; 24];
-                        let _ = rng.try_fill_bytes(&mut fluff);
+                        rng.try_fill_bytes(&mut fluff).unwrap();
                         fluff.to_vec()
                     }),
                 ),
@@ -415,7 +415,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id
                     );
                     send_data(&500_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
                     return;
                 }
                 Err(e) => {
@@ -424,7 +424,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id, e
                     );
                     send_data(&500_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
                     return;
                 }
             };
@@ -434,6 +434,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let cipher = XChaCha20Poly1305::new(key);
             let mut failed = false;
             for i in 0..7 {
+                trace!("Starting verification round {}/7 for Client-{}", i + 1, id);
                 let num1 = rand_core::RngCore::next_u64(&mut OsRng);
                 let num2 = rand_core::RngCore::next_u64(&mut OsRng);
                 let mut decryptnonce = [0u8; 24];
@@ -455,7 +456,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                                 id
                             );
                             send_data(&401_i32.to_le_bytes(), &stream);
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            stream.shutdown(std::net::Shutdown::Both).unwrap();
                             return;
                         } else {
                             data
@@ -467,7 +468,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        stream.shutdown(std::net::Shutdown::Both).unwrap();
                         return;
                     }
                 };
@@ -484,7 +485,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     id
                 );
                 send_data(&501_i32.to_le_bytes(), &stream);
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
                 return;
             }
             trace!("Client-{} passed all 7 verification rounds.", id);
@@ -497,7 +498,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 srp.start_handshake(&get_user_details(username, &pool, id).await);
             trace!("Sending serialized handshake to Client-{}...", id);
             let serialized = serde_json::to_vec(&handshake).unwrap();
-            let _ = rng.try_fill_bytes(&mut decryptnonce);
+            rng.try_fill_bytes(&mut decryptnonce).unwrap();
             let mut cleartext = Vec::new();
             cleartext.extend_from_slice(&decryptnonce);
             cleartext.extend_from_slice(&serialized);
@@ -517,7 +518,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        stream.shutdown(std::net::Shutdown::Both).unwrap();
                         return;
                     } else {
                         data
@@ -529,7 +530,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id, e
                     );
                     send_data(&400_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
                     return;
                 }
             };
@@ -543,7 +544,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id, e
                     );
                     send_data(&501_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
                     return;
                 }
             };
@@ -555,13 +556,13 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id, e
                     );
                     send_data(&501_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
                     return;
                 }
             };
             trace!("Sending strong proof to Client-{}...", id);
             let serialized = serde_json::to_vec(&strong_proof).unwrap();
-            let _ = rng.try_fill_bytes(&mut decryptnonce);
+            rng.try_fill_bytes(&mut decryptnonce).unwrap();
             let mut cleartext = Vec::new();
             cleartext.extend_from_slice(&decryptnonce);
             cleartext.extend_from_slice(&serialized);
@@ -591,7 +592,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id, e
                     );
                     send_data(&500_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
                     return;
                 }
             };
@@ -604,7 +605,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
         stream.peer_addr().unwrap().port(),
         id
     );
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    stream.shutdown(std::net::Shutdown::Both).unwrap();
 }
 
 fn generate_keys(id: usize) -> (RsaPrivateKey, RsaPublicKey) {
@@ -680,7 +681,7 @@ async fn srp6_register(
                     id, e
                 );
                 send_data(&500_i32.to_le_bytes(), stream);
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
                 return Vec::new();
             }
         };
@@ -700,7 +701,7 @@ async fn srp6_register(
                 id, e
             );
             send_data(&500_i32.to_le_bytes(), stream);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
             return Vec::new();
         }
     }
@@ -711,7 +712,7 @@ async fn srp6_register(
             id
         );
         send_data(&400_i32.to_le_bytes(), stream);
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
         return Vec::new();
     }
     match sqlx::query!(
@@ -736,7 +737,7 @@ async fn srp6_register(
                 id, e
             );
             send_data(&500_i32.to_le_bytes(), stream);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
             return Vec::new();
         }
     };
@@ -759,8 +760,8 @@ async fn get_user_details(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
         _ => {
             warn!("Invalid logon session sent by Client-{}", id);
             let (mut salt, mut verifier) = ([0u8; 256], [0u8; 256]);
-            let _ = OsRng.try_fill_bytes(&mut salt);
-            let _ = OsRng.try_fill_bytes(&mut verifier);
+            OsRng.try_fill_bytes(&mut salt).unwrap();
+            OsRng.try_fill_bytes(&mut verifier).unwrap();
             UserSecrets {
                 username: String::from_utf8_lossy(username).to_string(),
                 salt: Salt::from(salt),
