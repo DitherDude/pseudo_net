@@ -61,6 +61,9 @@ fn exchange_keys(stream: &TcpStream, identifier: u8) -> (Vec<u8>, RsaPublicKey, 
     );
     let payload = receive_data(stream);
     print!("\x1B[2K\r");
+    if payload.len() == 4 {
+        error_decode(&payload);
+    }
     let server_public =
         PublicKey::from_sec1_bytes(&payload[..65]).expect("Invalid server public key!");
     let shared_secret = client_secret.diffie_hellman(&server_public);
@@ -375,6 +378,7 @@ fn error_decode(code: &[u8]) {
         400 => "Client fault (thats us!). Server refused to elaborate what went wrong.",
         401 => "Server expected a larger payload.",
         402 => "Server expected a smaller payload.",
+        403 => "Forbidden. You may not access this resource.",
         500 => "Server fault! There is nothing we can do about it on our end though ¯\\_(ツ)_/¯.",
         501 => "The server actively refused the connection.",
         _ => "Unexpected error code!",

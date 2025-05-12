@@ -1,7 +1,3 @@
-// use aes_gcm_siv::{
-//     Aes256GcmSiv, Key, Nonce,
-//     aead::{Aead, KeyInit, OsRng},
-// };
 use chacha20poly1305::{
     XChaCha20Poly1305,
     aead::{Aead, KeyInit, OsRng},
@@ -53,19 +49,21 @@ async fn main() {
             match sqlx::query!(
                 r#"
                 SELECT 
-                COUNT(*) as count
+                    COUNT(*) as count
                 FROM 
-                INFORMATION_SCHEMA.COLUMNS
+                    INFORMATION_SCHEMA.COLUMNS
                 WHERE 
-                TABLE_NAME = 'users'
-                AND (COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_KEY) IN (
-                    ('userid', 'varbinary', 64, 'NO', 'PRI'),
-                    ('username', 'varbinary', 255, 'NO', 'UNI'),
-                    ('salt', 'varbinary', 512, 'NO', ''),
-                    ('verifier', 'varbinary', 512, 'NO', ''),
-                    ('nonce', 'varbinary', 255, 'YES', ''),
-                    ('user_pk', 'varbinary', 2048, 'YES', ''),
-                    ('magic', 'varbinary', 255, 'YES', '')
+                    TABLE_NAME = 'users'
+                AND (
+                    (COLUMN_NAME = 'userid' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 64 AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'username' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 255 AND IS_NULLABLE = 'NO' AND COLUMN_KEY = 'UNI')
+                    OR (COLUMN_NAME = 'salt' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 512 AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'verifier' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 512 AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'nonce' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 255)
+                    OR (COLUMN_NAME = 'user_pk' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 2048)
+                    OR (COLUMN_NAME = 'magic' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 255)
+                    OR (COLUMN_NAME = 'danger' AND DATA_TYPE = 'int' AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT = '0')
+                    OR (COLUMN_NAME = 'locked' AND DATA_TYPE = 'tinyint' AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT = '0')
                 );
                 "#
             )
@@ -73,7 +71,7 @@ async fn main() {
             .await
             {
                 Ok(Some(e)) => {
-                    if e.count == 7 {
+                    if e.count == 9 {
                         trace!("Users table schema is valid.");
                     } else {
                         warn!("Missing users table. Will attempt to create it.");
@@ -86,8 +84,13 @@ async fn main() {
                                 verifier varbinary(512) NOT NULL,
                                 nonce varbinary(255),
                                 user_pk varbinary(2048),
-                                magic varbinary(255)
-                            );
+                                magic varbinary(255),
+                                danger int unsigned DEFAULT 0 NOT NULL,
+                                locked BOOL DEFAULT 0 NOT NULL
+                            )
+                            ENGINE=InnoDB
+                            DEFAULT CHARSET=utf8mb4
+                            COLLATE=utf8mb4_0900_ai_ci; 
                             "#
                         )
                         .execute(&pool)
@@ -106,6 +109,61 @@ async fn main() {
                 Ok(None) => {}
                 Err(e) => {
                     error!("Failed to check users table schema: {}", e);
+                    exit(1);
+                }
+            }
+            trace!("Checking clients table schema...");
+            match sqlx::query!(
+                r#"
+                SELECT
+                    COUNT(*) as count
+                FROM
+                    INFORMATION_SCHEMA.COLUMNS
+                WHERE
+                    TABLE_NAME = 'clients'
+                AND (
+                    (COLUMN_NAME = 'client' AND DATA_TYPE = 'varchar' AND CHARACTER_MAXIMUM_LENGTH = 255 AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'penalty' AND DATA_TYPE = 'int' AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT = '0')
+                    OR (COLUMN_NAME = 'locked' AND DATA_TYPE = 'tinyint' AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT = '0')
+                );
+                "#
+            )
+            .fetch_optional(&pool)
+            .await
+            {
+                Ok(Some(e)) => {
+                    if e.count == 3 {
+                        trace!("Clients table schema is valid.");
+                    } else {
+                        warn!("Missing clients table. Will attempt to create it.");
+                        match sqlx::query!(
+                            r#"
+                            CREATE TABLE PSEUDO_NET.clients (
+                                client VARCHAR(255) NOT NULL UNIQUE,
+                                penalty INT UNSIGNED DEFAULT 0 NOT NULL,
+                                locked BOOL DEFAULT 0 NOT NULL
+                            )
+                            ENGINE=InnoDB
+                            DEFAULT CHARSET=utf8mb4
+                            COLLATE=utf8mb4_0900_ai_ci;
+                            "#
+                        )
+                        .execute(&pool)
+                        .await
+                        {
+                            Ok(_) => {
+                                trace!("Created clients table.");
+                            }
+                            Err(e) => {
+                                error!("Failed to create clients table: {}", e);
+                                exit(1);
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!("Failed to check clients table schema: {}", e);
                     exit(1);
                 }
             }
@@ -141,6 +199,51 @@ async fn main() {
 }
 
 async fn handle_connection(stream: TcpStream, id: usize) {
+    let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
+    match sqlx::query!(
+        r#"
+        SELECT
+        penalty, locked
+        FROM clients
+        WHERE
+        client = ?
+        "#,
+        stream.peer_addr().unwrap().ip().to_string()
+    )
+    .fetch_optional(&pool)
+    .await
+    {
+        Ok(Some(data)) => {
+            if data.locked == 1
+                || data.penalty
+                    > retreive_config("CLIENT-LOCKOUT")
+                        .parse::<u32>()
+                        .unwrap_or(1000)
+            {
+                warn!(
+                    "Client-{} is locked out. Sending errorcode and dropping connection.",
+                    id
+                );
+                send_data(&403_i32.to_le_bytes(), &stream);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+        }
+        Err(e) => {
+            error!(
+                "Internal error! Sending errorcode to Client-{} and dropping connection. {}",
+                id, e
+            );
+            send_data(&500_i32.to_le_bytes(), &stream);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        _ => {
+            trace!("Client-{} record is clear! Proceeding...", id);
+        }
+    };
+    trace!("Keypair generated for Client-{}.", id);
+    let (private_key, public_key) = generate_keys(id);
     let mut rng = OsRng;
     let parsed_data = match parse_data(&receive_data(&stream)) {
         Ok(data) => data,
@@ -170,15 +273,13 @@ async fn handle_connection(stream: TcpStream, id: usize) {
         Ok(data) => data,
         Err(e) => {
             warn!("Failed to decode client-{} public key: {}", id, e);
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
     };
     let shared_secret = server_secret.diffie_hellman(&client_public);
-    trace!("Shared secret derived from Client-{}!", id);
-    let (private_key, public_key) = generate_keys(id);
     trace!(
-        "Keypair generated for Client-{}. Encrypting public key...",
+        "Shared secret derived from Client-{}! Encrypting public key...",
         id
     );
     let mut hasher = Sha3_256::new();
@@ -187,7 +288,6 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     let cipher = XChaCha20Poly1305::new(key);
     let mut encryptnonce: [u8; 24] = [0u8; 24];
     rng.try_fill_bytes(&mut encryptnonce).unwrap();
-    //let encryptnonce = Nonce::from_slice(&encryptnonce);
     let mut cleartext = Vec::new();
     let mut decryptnonce = [0u8; 24];
     rng.try_fill_bytes(&mut decryptnonce).unwrap();
@@ -224,7 +324,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 id, e
             );
             send_data(&400_i32.to_le_bytes(), &stream);
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
     };
@@ -236,7 +336,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     id
                 );
                 send_data(&401_i32.to_le_bytes(), &stream);
-                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             } else if data.len() > 279 {
                 warn!(
@@ -244,7 +344,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     id
                 );
                 send_data(&402_i32.to_le_bytes(), &stream);
-                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             } else {
                 data
@@ -256,11 +356,10 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 id, e
             );
             send_data(&400_i32.to_le_bytes(), &stream);
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
     };
-    let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
     trace!(
         "Checking if Client-{}'s requested user \"{:?}\" exists.",
         id,
@@ -281,7 +380,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 id
             );
             send_data(&500_i32.to_le_bytes(), &stream);
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
         Err(e) => {
@@ -290,7 +389,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 id, e
             );
             send_data(&500_i32.to_le_bytes(), &stream);
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
     };
@@ -301,7 +400,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             id
         );
         send_data(&500_i32.to_le_bytes(), &stream);
-        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Both);
         return;
     }
     match parsed_data.indentifier {
@@ -315,9 +414,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 .encrypt(encryptnonce.into(), cleartext.as_ref())
                 .unwrap();
             send_data(&payload, &stream);
-            if userexists == 1 {
-                //login(&cleartext[24..])
-            } else {
+            if userexists != 1 {
                 let response = receive_data(&stream);
                 let ciphertext = match block_decrypt(&private_key, &response) {
                     Ok(data) => data,
@@ -327,7 +424,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
-                        stream.shutdown(std::net::Shutdown::Both).unwrap();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
                     }
                 };
@@ -339,7 +436,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
-                        stream.shutdown(std::net::Shutdown::Both).unwrap();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
                     }
                 };
@@ -350,7 +447,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
-                        stream.shutdown(std::net::Shutdown::Both).unwrap();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
                     }
                     Greater => {
@@ -359,7 +456,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id
                         );
                         send_data(&402_i32.to_le_bytes(), &stream);
-                        stream.shutdown(std::net::Shutdown::Both).unwrap();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
                     }
                     Equal => {
@@ -390,33 +487,56 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             }
         }
         1 => {
+            let mut failed = false;
             let (magic, mut encryptnonce) = match sqlx::query!(
-                r#"SELECT magic, nonce FROM users WHERE username = ?"#,
+                r#"SELECT magic, nonce, danger, locked FROM users WHERE username = ?"#,
                 &username
             )
             .fetch_optional(&pool)
             .await
             {
-                Ok(Some(data)) => (
-                    data.magic.unwrap_or_else(|| {
-                        let mut fluff = [0; 255];
+                Ok(Some(data)) => {
+                    if data.locked == 1
+                        || data.danger
+                            > retreive_config("USER-LOCKOUT")
+                                .parse::<u32>()
+                                .unwrap_or(1000)
+                    {
+                        warn!(
+                            "Client-{} requesting to login to user {:?}, who has been locked out.",
+                            id, username
+                        );
+                        failed = true;
+                        let mut fluff = [0u8; 256];
+                        let mut fluff2 = [0u8; 256];
                         rng.try_fill_bytes(&mut fluff).unwrap();
-                        fluff.to_vec()
-                    }),
-                    data.nonce.unwrap_or_else(|| {
-                        let mut fluff = [0u8; 24];
-                        rng.try_fill_bytes(&mut fluff).unwrap();
-                        fluff.to_vec()
-                    }),
-                ),
+                        rng.try_fill_bytes(&mut fluff2).unwrap();
+                        (fluff.to_vec(), fluff2.to_vec())
+                    } else {
+                        (
+                            data.magic.unwrap_or_else(|| {
+                                failed = true;
+                                let mut fluff = [0; 255];
+                                rng.try_fill_bytes(&mut fluff).unwrap();
+                                fluff.to_vec()
+                            }),
+                            data.nonce.unwrap_or_else(|| {
+                                failed = true;
+                                let mut fluff = [0u8; 24];
+                                rng.try_fill_bytes(&mut fluff).unwrap();
+                                fluff.to_vec()
+                            }),
+                        )
+                    }
+                }
                 Ok(None) => {
-                    warn!(
-                        "Unexpected response from database. Sending errorocode and dropping Client-{}.",
-                        id
-                    );
-                    send_data(&500_i32.to_le_bytes(), &stream);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
-                    return;
+                    warn!("User {:?} doesn't exist. Spoofing Client-{}.", username, id);
+                    failed = true;
+                    let mut fluff = [0u8; 256];
+                    let mut fluff2 = [0u8; 256];
+                    rng.try_fill_bytes(&mut fluff).unwrap();
+                    rng.try_fill_bytes(&mut fluff2).unwrap();
+                    (fluff.to_vec(), fluff2.to_vec())
                 }
                 Err(e) => {
                     error!(
@@ -424,7 +544,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id, e
                     );
                     send_data(&500_i32.to_le_bytes(), &stream);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                     return;
                 }
             };
@@ -432,7 +552,6 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             hasher.update(magic);
             let key = &hasher.finalize();
             let cipher = XChaCha20Poly1305::new(key);
-            let mut failed = false;
             for i in 0..7 {
                 trace!("Starting verification round {}/7 for Client-{}", i + 1, id);
                 let num1 = rand_core::RngCore::next_u64(&mut OsRng);
@@ -456,7 +575,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                                 id
                             );
                             send_data(&401_i32.to_le_bytes(), &stream);
-                            stream.shutdown(std::net::Shutdown::Both).unwrap();
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
                             return;
                         } else {
                             data
@@ -468,7 +587,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id, e
                         );
                         send_data(&400_i32.to_le_bytes(), &stream);
-                        stream.shutdown(std::net::Shutdown::Both).unwrap();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
                     }
                 };
@@ -484,12 +603,58 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     "Verification failure. Sending vague errorcode, and dropping Client-{}.",
                     id
                 );
+                if user_penalise(
+                    username,
+                    &pool,
+                    retreive_config("USER-PENALTY").parse::<i32>().unwrap_or(50),
+                )
+                .await
+                .is_none()
+                {
+                    warn!("Failed to penalise user.");
+                }
+                if client_penalise(
+                    &stream.peer_addr().unwrap().ip().to_string(),
+                    &pool,
+                    retreive_config("CLIENT-PENALTY")
+                        .parse::<i32>()
+                        .unwrap_or(50),
+                )
+                .await
+                .is_none()
+                {
+                    warn!("Failed to penalise client.");
+                }
                 send_data(&501_i32.to_le_bytes(), &stream);
-                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             }
             trace!("Client-{} passed all 7 verification rounds.", id);
             send_data(b"session resumed!", &stream);
+            if user_penalise(
+                username,
+                &pool,
+                retreive_config("SERVER-FORGIVE")
+                    .parse::<i32>()
+                    .unwrap_or(-100),
+            )
+            .await
+            .is_none()
+            {
+                warn!("Failed to forgive user.");
+            }
+            if client_penalise(
+                &stream.peer_addr().unwrap().ip().to_string(),
+                &pool,
+                retreive_config("CLIENT-FORGIVE")
+                    .parse::<i32>()
+                    .unwrap_or(-100),
+            )
+            .await
+            .is_none()
+            {
+                warn!("Failed to forgive client.");
+            }
         }
         2 => {
             let encryptnonce = &cleartext[..24];
@@ -505,7 +670,6 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let data = cipher
                 .encrypt(encryptnonce.into(), cleartext.as_ref())
                 .unwrap();
-            //let data = block_decrypt(&private_key, &serialized).unwrap();
             send_data(&data, &stream);
             trace!("Awaiting proof from Client-{}...", id);
             let response = receive_data(&stream);
@@ -518,7 +682,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
-                        stream.shutdown(std::net::Shutdown::Both).unwrap();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
                     } else {
                         data
@@ -530,7 +694,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id, e
                     );
                     send_data(&400_i32.to_le_bytes(), &stream);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                     return;
                 }
             };
@@ -544,20 +708,41 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id, e
                     );
                     send_data(&501_i32.to_le_bytes(), &stream);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                     return;
                 }
             };
             let (strong_proof, _session_key_server) = match proof_verifier.verify_proof(&proof) {
                 Ok(proof) => proof,
                 Err(e) => {
-                    warn!(
-                        "Failed to verify proof. Sending vague errorcode and dropping Client-{}. {}",
-                        id, e
-                    );
-                    send_data(&501_i32.to_le_bytes(), &stream);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
-                    return;
+                    warn!("Failed to verify proof. Spoofing Client-{}. {}", id, e);
+                    let mut fluff = [0u8; 32];
+                    let mut fluff2 = [0u8; 32];
+                    let _ = rng.try_fill_bytes(&mut fluff);
+                    let _ = rng.try_fill_bytes(&mut fluff2);
+                    if user_penalise(
+                        username,
+                        &pool,
+                        retreive_config("USER-PENALTY").parse::<i32>().unwrap_or(50),
+                    )
+                    .await
+                    .is_none()
+                    {
+                        warn!("Failed to penalise user.");
+                    }
+                    if client_penalise(
+                        &stream.peer_addr().unwrap().ip().to_string(),
+                        &pool,
+                        retreive_config("CLIENT-PENALTY")
+                            .parse::<i32>()
+                            .unwrap_or(50),
+                    )
+                    .await
+                    .is_none()
+                    {
+                        warn!("Failed to penalise client.");
+                    }
+                    (BigNumber::from(fluff), BigNumber::from(fluff2))
                 }
             };
             trace!("Sending strong proof to Client-{}...", id);
@@ -592,7 +777,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         id, e
                     );
                     send_data(&500_i32.to_le_bytes(), &stream);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                     return;
                 }
             };
@@ -605,7 +790,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
         stream.peer_addr().unwrap().port(),
         id
     );
-    stream.shutdown(std::net::Shutdown::Both).unwrap();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 fn generate_keys(id: usize) -> (RsaPrivateKey, RsaPublicKey) {
@@ -681,7 +866,7 @@ async fn srp6_register(
                     id, e
                 );
                 send_data(&500_i32.to_le_bytes(), stream);
-                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 return Vec::new();
             }
         };
@@ -701,7 +886,7 @@ async fn srp6_register(
                 id, e
             );
             send_data(&500_i32.to_le_bytes(), stream);
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return Vec::new();
         }
     }
@@ -712,7 +897,7 @@ async fn srp6_register(
             id
         );
         send_data(&400_i32.to_le_bytes(), stream);
-        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Both);
         return Vec::new();
     }
     match sqlx::query!(
@@ -737,7 +922,7 @@ async fn srp6_register(
                 id, e
             );
             send_data(&500_i32.to_le_bytes(), stream);
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return Vec::new();
         }
     };
@@ -746,17 +931,39 @@ async fn srp6_register(
 
 async fn get_user_details(username: &[u8], pool: &MySqlPool, id: usize) -> UserSecrets {
     match sqlx::query!(
-        "SELECT salt, verifier FROM users WHERE username = ?",
+        "SELECT salt, verifier, danger, locked FROM users WHERE username = ?",
         username
     )
     .fetch_optional(pool)
     .await
     {
-        Ok(Some(data)) => UserSecrets {
-            username: String::from_utf8_lossy(username).to_string(),
-            salt: srp6::prelude::BigNumber::from(&data.salt[..]),
-            verifier: srp6::prelude::BigNumber::from(&data.verifier[..]),
-        },
+        Ok(Some(data)) => {
+            if data.locked == 1
+                || data.danger
+                    > retreive_config("USER-LOCKOUT")
+                        .parse::<u32>()
+                        .unwrap_or(1000)
+            {
+                warn!(
+                    "Client-{} requesting to login to user {:?}, who has been locked out",
+                    id, username
+                );
+                let (mut salt, mut verifier) = ([0u8; 256], [0u8; 256]);
+                OsRng.try_fill_bytes(&mut salt).unwrap();
+                OsRng.try_fill_bytes(&mut verifier).unwrap();
+                UserSecrets {
+                    username: String::from_utf8_lossy(username).to_string(),
+                    salt: Salt::from(salt),
+                    verifier: PasswordVerifier::from(verifier),
+                }
+            } else {
+                UserSecrets {
+                    username: String::from_utf8_lossy(username).to_string(),
+                    salt: srp6::prelude::BigNumber::from(&data.salt[..]),
+                    verifier: srp6::prelude::BigNumber::from(&data.verifier[..]),
+                }
+            }
+        }
         _ => {
             warn!("Invalid logon session sent by Client-{}", id);
             let (mut salt, mut verifier) = ([0u8; 256], [0u8; 256]);
@@ -766,6 +973,132 @@ async fn get_user_details(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
                 username: String::from_utf8_lossy(username).to_string(),
                 salt: Salt::from(salt),
                 verifier: PasswordVerifier::from(verifier),
+            }
+        }
+    }
+}
+
+async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option<u32> {
+    let current = match sqlx::query!("SELECT danger FROM users WHERE username = ?", username)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(data) => match data {
+            Some(data) => data.danger,
+            None => {
+                warn!("Database error!");
+                return None;
+            }
+        },
+        Err(_) => {
+            warn!("Failed to query database.");
+            return None;
+        }
+    };
+    match amount.cmp(&0) {
+        Equal => Some(0),
+        Greater => {
+            let new = current.saturating_add(amount as u32);
+            match sqlx::query!(
+                "UPDATE users SET danger = ? WHERE username = ?",
+                new,
+                username
+            )
+            .execute(pool)
+            .await
+            {
+                Ok(_) => Some(new),
+                Err(_) => {
+                    warn!("Failed to query database.");
+                    None
+                }
+            }
+        }
+        Less => {
+            let new = current.saturating_sub(amount.unsigned_abs());
+            match sqlx::query!(
+                "UPDATE users SET danger = ? WHERE username = ?",
+                new,
+                username
+            )
+            .execute(pool)
+            .await
+            {
+                Ok(_) => Some(new),
+                Err(_) => {
+                    warn!("Failed to query database.");
+                    None
+                }
+            }
+        }
+    }
+}
+
+async fn client_penalise(client: &str, pool: &MySqlPool, amount: i32) -> Option<u32> {
+    let current = match sqlx::query!("SELECT penalty FROM clients WHERE client = ?", client)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(data) => match data {
+            Some(data) => data.penalty,
+            None => {
+                match sqlx::query!(
+                    r#"
+                    INSERT INTO clients (client)
+                    VALUES (?)
+                    "#,
+                    client
+                )
+                .execute(pool)
+                .await
+                {
+                    Ok(_) => 0,
+                    Err(_) => {
+                        warn!("Failed to insert client!");
+                        return None;
+                    }
+                }
+            }
+        },
+        Err(_) => {
+            warn!("Failed to query database.");
+            return None;
+        }
+    };
+    match amount.cmp(&0) {
+        Equal => Some(0),
+        Greater => {
+            let new = current.saturating_add(amount as u32);
+            match sqlx::query!(
+                "UPDATE clients SET penalty = ? WHERE client = ?",
+                new,
+                client
+            )
+            .execute(pool)
+            .await
+            {
+                Ok(_) => Some(new),
+                Err(_) => {
+                    warn!("Failed to query database.");
+                    None
+                }
+            }
+        }
+        Less => {
+            let new = current.saturating_sub(amount.unsigned_abs());
+            match sqlx::query!(
+                "UPDATE clients SET penalty = ? WHERE client = ?",
+                new,
+                client
+            )
+            .execute(pool)
+            .await
+            {
+                Ok(_) => Some(new),
+                Err(_) => {
+                    warn!("Failed to query database.");
+                    None
+                }
             }
         }
     }
