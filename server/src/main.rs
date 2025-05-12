@@ -1,7 +1,3 @@
-// use aes_gcm_siv::{
-//     Aes256GcmSiv, Key, Nonce,
-//     aead::{Aead, KeyInit, OsRng},
-// };
 use chacha20poly1305::{
     XChaCha20Poly1305,
     aead::{Aead, KeyInit, OsRng},
@@ -191,7 +187,6 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     let cipher = XChaCha20Poly1305::new(key);
     let mut encryptnonce: [u8; 24] = [0u8; 24];
     rng.try_fill_bytes(&mut encryptnonce).unwrap();
-    //let encryptnonce = Nonce::from_slice(&encryptnonce);
     let mut cleartext = Vec::new();
     let mut decryptnonce = [0u8; 24];
     rng.try_fill_bytes(&mut decryptnonce).unwrap();
@@ -319,9 +314,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 .encrypt(encryptnonce.into(), cleartext.as_ref())
                 .unwrap();
             send_data(&payload, &stream);
-            if userexists == 1 {
-                //login(&cleartext[24..])
-            } else {
+            if userexists != 1 {
                 let response = receive_data(&stream);
                 let ciphertext = match block_decrypt(&private_key, &response) {
                     Ok(data) => data,
@@ -509,7 +502,6 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let data = cipher
                 .encrypt(encryptnonce.into(), cleartext.as_ref())
                 .unwrap();
-            //let data = block_decrypt(&private_key, &serialized).unwrap();
             send_data(&data, &stream);
             trace!("Awaiting proof from Client-{}...", id);
             let response = receive_data(&stream);
