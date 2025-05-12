@@ -387,33 +387,51 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             }
         }
         1 => {
+            let mut failed = false;
             let (magic, mut encryptnonce) = match sqlx::query!(
-                r#"SELECT magic, nonce FROM users WHERE username = ?"#,
+                r#"SELECT magic, nonce, danger, locked FROM users WHERE username = ?"#,
                 &username
             )
             .fetch_optional(&pool)
             .await
             {
-                Ok(Some(data)) => (
-                    data.magic.unwrap_or_else(|| {
-                        let mut fluff = [0; 255];
+                Ok(Some(data)) => {
+                    if data.locked == 1 || data.danger > 1000 {
+                        warn!(
+                            "Client-{} requesting to login to user {:?}, who has been locked out.",
+                            id, username
+                        );
+                        failed = true;
+                        let mut fluff = [0u8; 256];
+                        let mut fluff2 = [0u8; 256];
                         rng.try_fill_bytes(&mut fluff).unwrap();
-                        fluff.to_vec()
-                    }),
-                    data.nonce.unwrap_or_else(|| {
-                        let mut fluff = [0u8; 24];
-                        rng.try_fill_bytes(&mut fluff).unwrap();
-                        fluff.to_vec()
-                    }),
-                ),
+                        rng.try_fill_bytes(&mut fluff2).unwrap();
+                        (fluff.to_vec(), fluff2.to_vec())
+                    } else {
+                        (
+                            data.magic.unwrap_or_else(|| {
+                                failed = true;
+                                let mut fluff = [0; 255];
+                                rng.try_fill_bytes(&mut fluff).unwrap();
+                                fluff.to_vec()
+                            }),
+                            data.nonce.unwrap_or_else(|| {
+                                failed = true;
+                                let mut fluff = [0u8; 24];
+                                rng.try_fill_bytes(&mut fluff).unwrap();
+                                fluff.to_vec()
+                            }),
+                        )
+                    }
+                }
                 Ok(None) => {
-                    warn!(
-                        "Unexpected response from database. Sending errorocode and dropping Client-{}.",
-                        id
-                    );
-                    send_data(&500_i32.to_le_bytes(), &stream);
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
-                    return;
+                    warn!("User {:?} doesn't exist. Spoofing Client-{}.", username, id);
+                    failed = true;
+                    let mut fluff = [0u8; 256];
+                    let mut fluff2 = [0u8; 256];
+                    rng.try_fill_bytes(&mut fluff).unwrap();
+                    rng.try_fill_bytes(&mut fluff2).unwrap();
+                    (fluff.to_vec(), fluff2.to_vec())
                 }
                 Err(e) => {
                     error!(
@@ -429,7 +447,6 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             hasher.update(magic);
             let key = &hasher.finalize();
             let cipher = XChaCha20Poly1305::new(key);
-            let mut failed = false;
             for i in 0..7 {
                 trace!("Starting verification round {}/7 for Client-{}", i + 1, id);
                 let num1 = rand_core::RngCore::next_u64(&mut OsRng);
@@ -481,6 +498,9 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     "Verification failure. Sending vague errorcode, and dropping Client-{}.",
                     id
                 );
+                if penalise(username, &pool, 50).await.is_none() {
+                    warn!("Failed to penalise user.");
+                }
                 send_data(&501_i32.to_le_bytes(), &stream);
                 stream.shutdown(std::net::Shutdown::Both).unwrap();
                 return;
@@ -551,6 +571,9 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         "Failed to verify proof. Sending vague errorcode and dropping Client-{}. {}",
                         id, e
                     );
+                    if penalise(username, &pool, 50).await.is_none() {
+                        warn!("Failed to penalise user.");
+                    }
                     send_data(&501_i32.to_le_bytes(), &stream);
                     stream.shutdown(std::net::Shutdown::Both).unwrap();
                     return;
@@ -742,17 +765,34 @@ async fn srp6_register(
 
 async fn get_user_details(username: &[u8], pool: &MySqlPool, id: usize) -> UserSecrets {
     match sqlx::query!(
-        "SELECT salt, verifier FROM users WHERE username = ?",
+        "SELECT salt, verifier, danger, locked FROM users WHERE username = ?",
         username
     )
     .fetch_optional(pool)
     .await
     {
-        Ok(Some(data)) => UserSecrets {
-            username: String::from_utf8_lossy(username).to_string(),
-            salt: srp6::prelude::BigNumber::from(&data.salt[..]),
-            verifier: srp6::prelude::BigNumber::from(&data.verifier[..]),
-        },
+        Ok(Some(data)) => {
+            if data.locked == 1 || data.danger > 1000 {
+                warn!(
+                    "Client-{} requesting to login to user {:?}, who has been locked out",
+                    id, username
+                );
+                let (mut salt, mut verifier) = ([0u8; 256], [0u8; 256]);
+                OsRng.try_fill_bytes(&mut salt).unwrap();
+                OsRng.try_fill_bytes(&mut verifier).unwrap();
+                UserSecrets {
+                    username: String::from_utf8_lossy(username).to_string(),
+                    salt: Salt::from(salt),
+                    verifier: PasswordVerifier::from(verifier),
+                }
+            } else {
+                UserSecrets {
+                    username: String::from_utf8_lossy(username).to_string(),
+                    salt: srp6::prelude::BigNumber::from(&data.salt[..]),
+                    verifier: srp6::prelude::BigNumber::from(&data.verifier[..]),
+                }
+            }
+        }
         _ => {
             warn!("Invalid logon session sent by Client-{}", id);
             let (mut salt, mut verifier) = ([0u8; 256], [0u8; 256]);
@@ -762,6 +802,62 @@ async fn get_user_details(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
                 username: String::from_utf8_lossy(username).to_string(),
                 salt: Salt::from(salt),
                 verifier: PasswordVerifier::from(verifier),
+            }
+        }
+    }
+}
+
+async fn penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option<u32> {
+    let current = match sqlx::query!("SELECT danger FROM users WHERE username = ?", username)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(data) => match data {
+            Some(data) => data.danger,
+            None => {
+                warn!("Database error!");
+                return None;
+            }
+        },
+        Err(_) => {
+            warn!("Failed to query database.");
+            return None;
+        }
+    };
+    match current.cmp(&0) {
+        Equal => Some(0),
+        Greater => {
+            let new = current.saturating_add(amount as u32);
+            match sqlx::query!(
+                "UPDATE users SET danger = ? WHERE username = ?",
+                new,
+                username
+            )
+            .execute(pool)
+            .await
+            {
+                Ok(_) => Some(new),
+                Err(_) => {
+                    warn!("Failed to query database.");
+                    None
+                }
+            }
+        }
+        Less => {
+            let new = current.saturating_sub(amount.unsigned_abs());
+            match sqlx::query!(
+                "UPDATE users SET danger = ? WHERE username = ?",
+                new,
+                username
+            )
+            .execute(pool)
+            .await
+            {
+                Ok(_) => Some(new),
+                Err(_) => {
+                    warn!("Failed to query database.");
+                    None
+                }
             }
         }
     }
