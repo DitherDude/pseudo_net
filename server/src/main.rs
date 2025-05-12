@@ -53,19 +53,21 @@ async fn main() {
             match sqlx::query!(
                 r#"
                 SELECT 
-                COUNT(*) as count
+                    COUNT(*) as count
                 FROM 
-                INFORMATION_SCHEMA.COLUMNS
+                    INFORMATION_SCHEMA.COLUMNS
                 WHERE 
-                TABLE_NAME = 'users'
-                AND (COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_KEY) IN (
-                    ('userid', 'varbinary', 64, 'NO', 'PRI'),
-                    ('username', 'varbinary', 255, 'NO', 'UNI'),
-                    ('salt', 'varbinary', 512, 'NO', ''),
-                    ('verifier', 'varbinary', 512, 'NO', ''),
-                    ('nonce', 'varbinary', 255, 'YES', ''),
-                    ('user_pk', 'varbinary', 2048, 'YES', ''),
-                    ('magic', 'varbinary', 255, 'YES', '')
+                    TABLE_NAME = 'users'
+                AND (
+                    (COLUMN_NAME = 'userid' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 64 AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'username' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 255 AND IS_NULLABLE = 'NO' AND COLUMN_KEY = 'UNI')
+                    OR (COLUMN_NAME = 'salt' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 512 AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'verifier' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 512 AND IS_NULLABLE = 'NO')
+                    OR (COLUMN_NAME = 'nonce' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 255)
+                    OR (COLUMN_NAME = 'user_pk' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 2048)
+                    OR (COLUMN_NAME = 'magic' AND DATA_TYPE = 'varbinary' AND CHARACTER_MAXIMUM_LENGTH = 255)
+                    OR (COLUMN_NAME = 'danger' AND DATA_TYPE = 'int' AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT = '0')
+                    OR (COLUMN_NAME = 'locked' AND DATA_TYPE = 'tinyint' AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT = '0')
                 );
                 "#
             )
@@ -73,7 +75,7 @@ async fn main() {
             .await
             {
                 Ok(Some(e)) => {
-                    if e.count == 7 {
+                    if e.count == 9 {
                         trace!("Users table schema is valid.");
                     } else {
                         warn!("Missing users table. Will attempt to create it.");
@@ -86,7 +88,9 @@ async fn main() {
                                 verifier varbinary(512) NOT NULL,
                                 nonce varbinary(255),
                                 user_pk varbinary(2048),
-                                magic varbinary(255)
+                                magic varbinary(255),
+                                danger int unsigned DEFAULT 0 NOT NULL,
+                                locked BOOL DEFAULT 0 NOT NULL
                             );
                             "#
                         )
