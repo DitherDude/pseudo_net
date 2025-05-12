@@ -214,7 +214,12 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     .await
     {
         Ok(Some(data)) => {
-            if data.locked == 1 || data.penalty > 1000 {
+            if data.locked == 1
+                || data.penalty
+                    > retreive_config("CLIENT-LOCKOUT")
+                        .parse::<u32>()
+                        .unwrap_or(1000)
+            {
                 warn!(
                     "Client-{} is locked out. Sending errorcode and dropping connection.",
                     id
@@ -491,7 +496,12 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             .await
             {
                 Ok(Some(data)) => {
-                    if data.locked == 1 || data.danger > 1000 {
+                    if data.locked == 1
+                        || data.danger
+                            > retreive_config("USER-LOCKOUT")
+                                .parse::<u32>()
+                                .unwrap_or(1000)
+                    {
                         warn!(
                             "Client-{} requesting to login to user {:?}, who has been locked out.",
                             id, username
@@ -593,12 +603,25 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     "Verification failure. Sending vague errorcode, and dropping Client-{}.",
                     id
                 );
-                if user_penalise(username, &pool, 50).await.is_none() {
+                if user_penalise(
+                    username,
+                    &pool,
+                    retreive_config("USER-PENALTY").parse::<i32>().unwrap_or(50),
+                )
+                .await
+                .is_none()
+                {
                     warn!("Failed to penalise user.");
                 }
-                if client_penalise(&stream.peer_addr().unwrap().ip().to_string(), &pool, 50)
-                    .await
-                    .is_none()
+                if client_penalise(
+                    &stream.peer_addr().unwrap().ip().to_string(),
+                    &pool,
+                    retreive_config("CLIENT-PENALTY")
+                        .parse::<i32>()
+                        .unwrap_or(50),
+                )
+                .await
+                .is_none()
                 {
                     warn!("Failed to penalise client.");
                 }
@@ -608,12 +631,27 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             }
             trace!("Client-{} passed all 7 verification rounds.", id);
             send_data(b"session resumed!", &stream);
-            if user_penalise(username, &pool, -100).await.is_none() {
+            if user_penalise(
+                username,
+                &pool,
+                retreive_config("SERVER-FORGIVE")
+                    .parse::<i32>()
+                    .unwrap_or(-100),
+            )
+            .await
+            .is_none()
+            {
                 warn!("Failed to forgive user.");
             }
-            if client_penalise(&stream.peer_addr().unwrap().ip().to_string(), &pool, -100)
-                .await
-                .is_none()
+            if client_penalise(
+                &stream.peer_addr().unwrap().ip().to_string(),
+                &pool,
+                retreive_config("CLIENT-FORGIVE")
+                    .parse::<i32>()
+                    .unwrap_or(-100),
+            )
+            .await
+            .is_none()
             {
                 warn!("Failed to forgive client.");
             }
@@ -682,12 +720,25 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     let mut fluff2 = [0u8; 32];
                     let _ = rng.try_fill_bytes(&mut fluff);
                     let _ = rng.try_fill_bytes(&mut fluff2);
-                    if user_penalise(username, &pool, 50).await.is_none() {
+                    if user_penalise(
+                        username,
+                        &pool,
+                        retreive_config("USER-PENALTY").parse::<i32>().unwrap_or(50),
+                    )
+                    .await
+                    .is_none()
+                    {
                         warn!("Failed to penalise user.");
                     }
-                    if client_penalise(&stream.peer_addr().unwrap().ip().to_string(), &pool, 50)
-                        .await
-                        .is_none()
+                    if client_penalise(
+                        &stream.peer_addr().unwrap().ip().to_string(),
+                        &pool,
+                        retreive_config("CLIENT-PENALTY")
+                            .parse::<i32>()
+                            .unwrap_or(50),
+                    )
+                    .await
+                    .is_none()
                     {
                         warn!("Failed to penalise client.");
                     }
@@ -887,7 +938,12 @@ async fn get_user_details(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
     .await
     {
         Ok(Some(data)) => {
-            if data.locked == 1 || data.danger > 1000 {
+            if data.locked == 1
+                || data.danger
+                    > retreive_config("USER-LOCKOUT")
+                        .parse::<u32>()
+                        .unwrap_or(1000)
+            {
                 warn!(
                     "Client-{} requesting to login to user {:?}, who has been locked out",
                     id, username
