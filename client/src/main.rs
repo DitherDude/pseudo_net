@@ -64,7 +64,7 @@ fn exchange_keys(stream: &TcpStream, identifier: u8) -> (Vec<u8>, RsaPublicKey, 
     if payload.len() == 4 {
         error_decode(&payload);
     }
-    if payload.len() == 0 {
+    if payload.is_empty() {
         error_decode(&500_i32.to_le_bytes());
     }
     let server_public =
@@ -193,30 +193,28 @@ fn resume_session(
     hasher.update(unlockkey);
     let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&hasher.finalize()));
     decryptnonce = nextnonce.try_into().unwrap();
-    for i in 0..7 {
-        trace!("Awaiting sum from server ({}/7)...", i + 1);
-        let response = receive_data(stream);
-        if response.len() == 4 {
-            error_decode(&response);
-        }
-        let rawdata = match cipher.decrypt(&decryptnonce.into(), response.as_ref()) {
-            Ok(data) => data,
-            Err(_) => error_decode(&400_i32.to_le_bytes()),
-        };
-        encryptnonce = rawdata[..24].to_vec();
-        let num1 = u64::from_le_bytes(rawdata[24..32].try_into().unwrap());
-        let num2 = u64::from_le_bytes(rawdata[32..40].try_into().unwrap());
-        let sum = num1 ^ num2;
-        rng.try_fill_bytes(&mut decryptnonce).unwrap();
-        let mut data = Vec::new();
-        data.extend_from_slice(&decryptnonce);
-        data.extend_from_slice(&sum.to_le_bytes());
-        let payload = cipher
-            .encrypt(GenericArray::from_slice(&encryptnonce), data.as_ref())
-            .unwrap();
-        trace!("returning XOR result... ");
-        send_data(&payload, stream);
+    trace!("Awaiting sum from server ...");
+    let response = receive_data(stream);
+    if response.len() == 4 {
+        error_decode(&response);
     }
+    let rawdata = match cipher.decrypt(&decryptnonce.into(), response.as_ref()) {
+        Ok(data) => data,
+        Err(_) => error_decode(&400_i32.to_le_bytes()),
+    };
+    encryptnonce = rawdata[..24].to_vec();
+    let num1 = u64::from_le_bytes(rawdata[24..32].try_into().unwrap());
+    let num2 = u64::from_le_bytes(rawdata[32..40].try_into().unwrap());
+    let sum = num1 ^ num2;
+    rng.try_fill_bytes(&mut decryptnonce).unwrap();
+    let mut data = Vec::new();
+    data.extend_from_slice(&decryptnonce);
+    data.extend_from_slice(&sum.to_le_bytes());
+    let payload = cipher
+        .encrypt(GenericArray::from_slice(&encryptnonce), data.as_ref())
+        .unwrap();
+    trace!("returning XOR result... ");
+    send_data(&payload, stream);
     let payload = receive_data(stream);
     if payload.len() == 4 {
         error_decode(&payload);

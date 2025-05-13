@@ -524,7 +524,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     fluff.to_vec()
                 }
             };
-            let mut encryptnonce =
+            let encryptnonce =
                 match sqlx::query!("SELECT nonce FROM users WHERE username = ?", username)
                     .fetch_optional(&pool)
                     .await
@@ -553,49 +553,46 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         fluff.to_vec()
                     }
                 };
-            //println!("Serialized: {:?}", token);
             let mut hasher = Sha3_256::new();
             hasher.update(&token);
             let token = hasher.finalize();
             let cipher = XChaCha20Poly1305::new(&token);
-            for i in 0..7 {
-                trace!("Starting verification round {}/7 for Client-{}", i + 1, id);
-                let num1 = rand_core::RngCore::next_u64(&mut OsRng);
-                let num2 = rand_core::RngCore::next_u64(&mut OsRng);
-                let mut decryptnonce = [0u8; 24];
-                rng.try_fill_bytes(&mut decryptnonce).unwrap();
-                let mut cleartext = Vec::new();
-                cleartext.extend_from_slice(&decryptnonce);
-                cleartext.extend_from_slice(&num1.to_le_bytes());
-                cleartext.extend_from_slice(&num2.to_le_bytes());
-                let data = cipher
-                    .encrypt(GenericArray::from_slice(&encryptnonce), cleartext.as_ref())
-                    .unwrap();
-                send_data(&data, &stream);
-                let response = receive_data(&stream);
-                let data = match cipher.decrypt(&decryptnonce.into(), &response[..]) {
-                    Ok(data) => {
-                        if data.len() <= 24 {
-                            trace!(
-                                "Data is too short (username must be at least 1b). Sending errorcode and dropping Client-{}.",
-                                id
-                            );
-                            send_data(&401_i32.to_le_bytes(), &stream);
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-                            return;
-                        } else {
-                            data
-                        }
+            trace!("Starting verification for Client-{}", id);
+            let num1 = rand_core::RngCore::next_u64(&mut OsRng);
+            let num2 = rand_core::RngCore::next_u64(&mut OsRng);
+            let mut decryptnonce = [0u8; 24];
+            rng.try_fill_bytes(&mut decryptnonce).unwrap();
+            let mut cleartext = Vec::new();
+            cleartext.extend_from_slice(&decryptnonce);
+            cleartext.extend_from_slice(&num1.to_le_bytes());
+            cleartext.extend_from_slice(&num2.to_le_bytes());
+            let data = cipher
+                .encrypt(GenericArray::from_slice(&encryptnonce), cleartext.as_ref())
+                .unwrap();
+            send_data(&data, &stream);
+            let response = receive_data(&stream);
+            let data = match cipher.decrypt(&decryptnonce.into(), &response[..]) {
+                Ok(data) => {
+                    if data.len() <= 24 {
+                        trace!(
+                            "Data is too short (username must be at least 1b). Sending errorcode and dropping Client-{}.",
+                            id
+                        );
+                        send_data(&401_i32.to_le_bytes(), &stream);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    } else {
+                        data
                     }
-                    Err(_) => [0u8; 25].to_vec(),
-                };
-                let nextnonce = &data[..24];
-                if data[24..].to_vec() != (num1 ^ num2).to_le_bytes().to_vec() {
-                    trace!("Client-{} failed verification round {}/7", id, i);
-                    failed = true;
                 }
-                encryptnonce = nextnonce.to_vec();
+                Err(_) => [0u8; 25].to_vec(),
+            };
+            let _nextnonce = &data[..24];
+            if data[24..].to_vec() != (num1 ^ num2).to_le_bytes().to_vec() {
+                trace!("Client-{} failed verification.", id);
+                failed = true;
             }
+            //encryptnonce = nextnonce.to_vec();
             if failed {
                 trace!(
                     "Verification failure. Sending vague errorcode, and dropping Client-{}.",
