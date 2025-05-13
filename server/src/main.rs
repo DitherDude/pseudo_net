@@ -587,15 +587,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             data
                         }
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to decrypt data. Sending errorocode and dropping Client-{}. {}",
-                            id, e
-                        );
-                        send_data(&400_i32.to_le_bytes(), &stream);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                        return;
-                    }
+                    Err(_) => [0u8; 25].to_vec(),
                 };
                 let nextnonce = &data[..24];
                 if data[24..].to_vec() != (num1 ^ num2).to_le_bytes().to_vec() {
