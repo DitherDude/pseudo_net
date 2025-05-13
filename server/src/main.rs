@@ -8,7 +8,7 @@ use rsa::{
     pkcs8::EncodePublicKey,
     rand_core::{self, RngCore},
 };
-use sha3::{Digest, Sha3_256, digest::generic_array::GenericArray};
+use sha3::{Digest, Sha3_256, Sha3_512, digest::generic_array::GenericArray};
 use sqlx::mysql::MySqlPool;
 use srp6::prelude::*;
 use std::cmp::Ordering::{Equal, Greater, Less};
@@ -199,6 +199,7 @@ async fn main() {
 }
 
 async fn handle_connection(stream: TcpStream, id: usize) {
+    let clientip = stream.peer_addr().unwrap().ip().to_string();
     let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
     match sqlx::query!(
         r#"
@@ -208,7 +209,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
         WHERE
         client = ?
         "#,
-        stream.peer_addr().unwrap().ip().to_string()
+        clientip
     )
     .fetch_optional(&pool)
     .await
@@ -465,93 +466,98 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         let verifier = &payload[536..1048];
                         rng.try_fill_bytes(&mut decryptnonce).unwrap();
                         let mut plaintext = Vec::new();
-                        plaintext.extend_from_slice(&decryptnonce);
-                        plaintext.extend_from_slice(
-                            &srp6_register(
-                                username,
-                                &pool,
-                                &stream,
-                                salt,
-                                verifier,
-                                &decryptnonce,
-                                id,
-                            )
-                            .await,
-                        );
-                        let data = cipher
-                            .encrypt(encryptnonce.into(), plaintext.as_ref())
-                            .unwrap();
-                        send_data(&data, &stream);
+                        if srp6_register(
+                            username,
+                            &pool,
+                            &stream,
+                            salt,
+                            verifier,
+                            &decryptnonce,
+                            id,
+                        )
+                        .await
+                        {
+                            let token = get_user_token(username, &pool, &clientip).await;
+                            plaintext.extend_from_slice(&decryptnonce);
+                            plaintext.extend_from_slice(&match token {
+                            Some(data) => data,
+                            None => {
+                                warn!(
+                                    "Failed to generate token. Sending errorcode and dropping Client-{}.",
+                                    id
+                                );
+                                send_data(&500_i32.to_le_bytes(), &stream);
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        });
+                            let data = cipher
+                                .encrypt(encryptnonce.into(), plaintext.as_ref())
+                                .unwrap();
+                            send_data(&data, &stream);
+                        } else {
+                            warn!(
+                                "Somehow we got here. It wasn't our fault, rather that of Client-{}",
+                                id
+                            );
+                            return;
+                        }
                     }
                 }
             }
         }
         1 => {
             let mut failed = false;
-            let (magic, mut encryptnonce) = match sqlx::query!(
-                r#"SELECT magic, nonce, danger, locked FROM users WHERE username = ?"#,
-                &username
-            )
-            .fetch_optional(&pool)
-            .await
-            {
-                Ok(Some(data)) => {
-                    if data.locked == 1
-                        || data.danger
-                            > retreive_config("USER-LOCKOUT")
-                                .parse::<u32>()
-                                .unwrap_or(1000)
-                    {
-                        warn!(
-                            "Client-{} requesting to login to user {:?}, who has been locked out.",
-                            id, username
-                        );
-                        failed = true;
-                        let mut fluff = [0u8; 256];
-                        let mut fluff2 = [0u8; 256];
-                        rng.try_fill_bytes(&mut fluff).unwrap();
-                        rng.try_fill_bytes(&mut fluff2).unwrap();
-                        (fluff.to_vec(), fluff2.to_vec())
-                    } else {
-                        (
-                            data.magic.unwrap_or_else(|| {
-                                failed = true;
-                                let mut fluff = [0; 255];
-                                rng.try_fill_bytes(&mut fluff).unwrap();
-                                fluff.to_vec()
-                            }),
-                            data.nonce.unwrap_or_else(|| {
-                                failed = true;
-                                let mut fluff = [0u8; 24];
-                                rng.try_fill_bytes(&mut fluff).unwrap();
-                                fluff.to_vec()
-                            }),
-                        )
-                    }
+            let token = match get_user_token(username, &pool, &clientip).await {
+                Some(data) => {
+                    trace!("Got token for user {:?}.", username);
+                    data
                 }
-                Ok(None) => {
-                    warn!("User {:?} doesn't exist. Spoofing Client-{}.", username, id);
+                _ => {
+                    warn!(
+                        "Incurred error receiveing token for user {:?}. Spoofing Client-{}.",
+                        username, id
+                    );
                     failed = true;
                     let mut fluff = [0u8; 256];
-                    let mut fluff2 = [0u8; 256];
                     rng.try_fill_bytes(&mut fluff).unwrap();
-                    rng.try_fill_bytes(&mut fluff2).unwrap();
-                    (fluff.to_vec(), fluff2.to_vec())
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to query database. Sending errorocode and dropping Client-{}. {}",
-                        id, e
-                    );
-                    send_data(&500_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    return;
+                    fluff.to_vec()
                 }
             };
+            let mut encryptnonce =
+                match sqlx::query!("SELECT nonce FROM users WHERE username = ?", username)
+                    .fetch_optional(&pool)
+                    .await
+                {
+                    Ok(data) => match data {
+                        Some(data) => data.nonce.unwrap_or_else(|| {
+                            warn!("Database error!");
+                            failed = true;
+                            let mut fluff = [0u8; 24];
+                            rng.try_fill_bytes(&mut fluff).unwrap();
+                            fluff.to_vec()
+                        }),
+                        None => {
+                            warn!("Database error!");
+                            failed = true;
+                            let mut fluff = [0u8; 24];
+                            rng.try_fill_bytes(&mut fluff).unwrap();
+                            fluff.to_vec()
+                        }
+                    },
+                    Err(_) => {
+                        warn!("Failed to query database.");
+                        failed = true;
+                        let mut fluff = [0u8; 24];
+                        rng.try_fill_bytes(&mut fluff).unwrap();
+                        fluff.to_vec()
+                    }
+                };
+            //println!("Serialized: {:?}", token);
             let mut hasher = Sha3_256::new();
-            hasher.update(magic);
-            let key = &hasher.finalize();
-            let cipher = XChaCha20Poly1305::new(key);
+            hasher.update(&token);
+            let token = hasher.finalize();
+            let cipher = XChaCha20Poly1305::new(&token);
             for i in 0..7 {
                 trace!("Starting verification round {}/7 for Client-{}", i + 1, id);
                 let num1 = rand_core::RngCore::next_u64(&mut OsRng);
@@ -614,7 +620,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     warn!("Failed to penalise user.");
                 }
                 if client_penalise(
-                    &stream.peer_addr().unwrap().ip().to_string(),
+                    &clientip,
                     &pool,
                     retreive_config("CLIENT-PENALTY")
                         .parse::<i32>()
@@ -644,7 +650,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 warn!("Failed to forgive user.");
             }
             if client_penalise(
-                &stream.peer_addr().unwrap().ip().to_string(),
+                &clientip,
                 &pool,
                 retreive_config("CLIENT-FORGIVE")
                     .parse::<i32>()
@@ -660,7 +666,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let encryptnonce = &cleartext[..24];
             let srp = Srp6_4096::default();
             let (handshake, proof_verifier) =
-                srp.start_handshake(&get_user_details(username, &pool, id).await);
+                srp.start_handshake(&get_user_secrets(username, &pool, id).await);
             trace!("Sending serialized handshake to Client-{}...", id);
             let serialized = serde_json::to_vec(&handshake).unwrap();
             rng.try_fill_bytes(&mut decryptnonce).unwrap();
@@ -712,10 +718,12 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     return;
                 }
             };
-            let (strong_proof, _session_key_server) = match proof_verifier.verify_proof(&proof) {
+            let mut verified = true;
+            let (_strong_proof, _session_key_server) = match proof_verifier.verify_proof(&proof) {
                 Ok(proof) => proof,
                 Err(e) => {
                     warn!("Failed to verify proof. Spoofing Client-{}. {}", id, e);
+                    verified = false;
                     let mut fluff = [0u8; 32];
                     let mut fluff2 = [0u8; 32];
                     let _ = rng.try_fill_bytes(&mut fluff);
@@ -731,7 +739,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         warn!("Failed to penalise user.");
                     }
                     if client_penalise(
-                        &stream.peer_addr().unwrap().ip().to_string(),
+                        &clientip,
                         &pool,
                         retreive_config("CLIENT-PENALTY")
                             .parse::<i32>()
@@ -745,9 +753,44 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     (BigNumber::from(fluff), BigNumber::from(fluff2))
                 }
             };
-            trace!("Sending strong proof to Client-{}...", id);
-            let serialized = serde_json::to_vec(&strong_proof).unwrap();
-            rng.try_fill_bytes(&mut decryptnonce).unwrap();
+            let mut decryptnonce = decryptnonce.to_vec();
+            let serialized = if verified {
+                trace!("Sending unlockkey to Client-{}...", id);
+                decryptnonce =
+                    match sqlx::query!("SELECT nonce FROM users WHERE username = ?", username)
+                        .fetch_optional(&pool)
+                        .await
+                    {
+                        Ok(data) => match data {
+                            Some(data) => data.nonce.unwrap_or_else(|| {
+                                warn!("Database error!");
+                                let mut fluff = [0u8; 24];
+                                rng.try_fill_bytes(&mut fluff).unwrap();
+                                fluff.to_vec()
+                            }),
+                            None => {
+                                warn!("Database error!");
+                                let mut fluff = [0u8; 24];
+                                rng.try_fill_bytes(&mut fluff).unwrap();
+                                fluff.to_vec()
+                            }
+                        },
+                        Err(_) => {
+                            warn!("Failed to query database.");
+                            let mut fluff = [0u8; 24];
+                            rng.try_fill_bytes(&mut fluff).unwrap();
+                            fluff.to_vec()
+                        }
+                    };
+                get_user_token(username, &pool, &clientip)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                trace!("Generating spoof key for Client-{}...", id);
+                let mut fluff = [0u8; 256];
+                rng.try_fill_bytes(&mut fluff).unwrap();
+                fluff.to_vec()
+            };
             let mut cleartext = Vec::new();
             cleartext.extend_from_slice(&decryptnonce);
             cleartext.extend_from_slice(&serialized);
@@ -755,32 +798,6 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 .encrypt(encryptnonce.into(), cleartext.as_ref())
                 .unwrap();
             send_data(&data, &stream);
-            let mut hasher = Sha3_256::new();
-            hasher.update(strong_proof.to_vec());
-            let magic = hasher.finalize();
-            match sqlx::query!(
-                r#"UPDATE users
-                SET nonce = ?,
-                magic = ?
-                WHERE username = ?"#,
-                &decryptnonce[..],
-                &magic[..],
-                &username[..],
-            )
-            .execute(&pool)
-            .await
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    error!(
-                        "Failed to query database. Sending errorcode and dropping Client-{}. {}",
-                        id, e
-                    );
-                    send_data(&500_i32.to_le_bytes(), &stream);
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    return;
-                }
-            };
         }
         _ => {}
     }
@@ -847,7 +864,7 @@ async fn srp6_register(
     verifier: &[u8],
     decryptnonce: &[u8],
     id: usize,
-) -> Vec<u8> {
+) -> bool {
     let mut rng = OsRng;
     let mut magic = [0u8; 255];
     rng.try_fill_bytes(&mut magic).unwrap();
@@ -867,7 +884,7 @@ async fn srp6_register(
                 );
                 send_data(&500_i32.to_le_bytes(), stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
-                return Vec::new();
+                return false;
             }
         };
         if result.is_none() {
@@ -887,7 +904,7 @@ async fn srp6_register(
             );
             send_data(&500_i32.to_le_bytes(), stream);
             let _ = stream.shutdown(std::net::Shutdown::Both);
-            return Vec::new();
+            return false;
         }
     }
     .is_some()
@@ -898,7 +915,7 @@ async fn srp6_register(
         );
         send_data(&400_i32.to_le_bytes(), stream);
         let _ = stream.shutdown(std::net::Shutdown::Both);
-        return Vec::new();
+        return false;
     }
     match sqlx::query!(
         r#"
@@ -923,13 +940,13 @@ async fn srp6_register(
             );
             send_data(&500_i32.to_le_bytes(), stream);
             let _ = stream.shutdown(std::net::Shutdown::Both);
-            return Vec::new();
+            return false;
         }
     };
-    magic.to_vec()
+    true
 }
 
-async fn get_user_details(username: &[u8], pool: &MySqlPool, id: usize) -> UserSecrets {
+async fn get_user_secrets(username: &[u8], pool: &MySqlPool, id: usize) -> UserSecrets {
     match sqlx::query!(
         "SELECT salt, verifier, danger, locked FROM users WHERE username = ?",
         username
@@ -976,6 +993,65 @@ async fn get_user_details(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
             }
         }
     }
+}
+
+async fn get_user_token(username: &[u8], pool: &MySqlPool, client: &str) -> Option<Vec<u8>> {
+    let (userid, salt, verifier, magic) = match sqlx::query!(
+        "SELECT userid, salt, verifier, magic FROM users WHERE username = ?",
+        username
+    )
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(data)) => (data.userid, data.salt, data.verifier, data.magic),
+        _ => return None,
+    };
+    let mut user = Vec::new();
+    user.extend_from_slice(username);
+    user.extend_from_slice(client.as_bytes());
+    user.extend_from_slice(&userid);
+    let mut hash1 = Sha3_512::new();
+    let mut hash2 = Sha3_512::new();
+    let mut hash3 = Sha3_512::new();
+    let mut hash4 = Sha3_512::new();
+    hash1.update(&salt);
+    hash2.update(&verifier);
+    hash3.update(&user);
+    hash4.update(magic.unwrap_or_default());
+    let keys = [
+        &hash1.finalize(),
+        &hash2.finalize(),
+        &hash3.finalize(),
+        &hash4.finalize(),
+    ];
+    let mut newkeys = [
+        vec![u8::default()],
+        vec![u8::default()],
+        vec![u8::default()],
+        vec![u8::default()],
+    ];
+    for key in keys {
+        for i in 0..key.len() / 4 {
+            newkeys[0].push(key[i * 4]);
+            newkeys[1].push(key[i * 4 + 1]);
+            newkeys[2].push(key[i * 4 + 2]);
+            newkeys[3].push(key[i * 4 + 3]);
+        }
+    }
+    let mut hash1 = Sha3_512::new();
+    let mut hash2 = Sha3_512::new();
+    let mut hash3 = Sha3_512::new();
+    let mut hash4 = Sha3_512::new();
+    let mut data = Vec::new();
+    hash1.update(&newkeys[0]);
+    hash2.update(&newkeys[1]);
+    hash3.update(&newkeys[2]);
+    hash4.update(&newkeys[3]);
+    data.extend_from_slice(&hash1.finalize());
+    data.extend_from_slice(&hash2.finalize());
+    data.extend_from_slice(&hash3.finalize());
+    data.extend_from_slice(&hash4.finalize());
+    Some(data)
 }
 
 async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option<u32> {

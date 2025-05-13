@@ -135,27 +135,32 @@ fn new_session(stream: &TcpStream) {
         }
         let cleartext = cipher.decrypt(&decryptnonce.into(), &response[..]).unwrap();
         let encryptnonce = &cleartext[..24];
-        let magic = &cleartext[24..];
+        let key = &cleartext[24..];
         trace!("Registration successful. Creating a new session to server, and logging in.");
         resume_session(
             &TcpStream::connect(&serverip).unwrap(),
             Some(username),
-            magic,
+            key,
             encryptnonce,
         );
     } else {
-        let (magic, encryptnonce, username) =
+        let (key, encryptnonce, username) =
             login(&TcpStream::connect(&serverip).unwrap(), Some(username));
         resume_session(
             &TcpStream::connect(&serverip).unwrap(),
             Some(&username),
-            &magic,
+            &key,
             &encryptnonce,
         );
     };
 }
 
-fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], nextnonce: &[u8]) {
+fn resume_session(
+    stream: &TcpStream,
+    usernameraw: Option<&[u8]>,
+    unlockkey: &[u8],
+    nextnonce: &[u8],
+) {
     let mut rng = OsRng;
     debug!("Resume session requested.");
     let username = match usernameraw {
@@ -171,7 +176,6 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
     );
     let key = GenericArray::from_slice(&rawkeybytes);
     let cipher = XChaCha20Poly1305::new(key);
-
     let mut decryptnonce = [0u8; 24];
     rng.try_fill_bytes(&mut decryptnonce).unwrap();
     let mut cleartext = Vec::new();
@@ -183,10 +187,8 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, magic: &[u8], 
     let payload = block_encrypt(&public_key, &ciphertext).unwrap();
     send_data(&payload, stream);
     let mut hasher = Sha3_256::new();
-    hasher.update(magic);
-    let key = &hasher.finalize();
-    let key = GenericArray::from_slice(key);
-    let cipher = XChaCha20Poly1305::new(key);
+    hasher.update(unlockkey);
+    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&hasher.finalize()));
     decryptnonce = nextnonce.try_into().unwrap();
     for i in 0..7 {
         trace!("Awaiting sum from server ({}/7)...", i + 1);
@@ -275,7 +277,7 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> (Vec<u8>, Vec<u8>, V
         .unwrap();
     let encryptnonce = &cleartext[..24];
     let handshake: Handshake<512, 512> = serde_json::from_slice(&cleartext[24..]).unwrap();
-    let (proof, strong_proof_verifier) = handshake
+    let (proof, _strong_proof_verifier) = handshake
         .calculate_proof(&String::from_utf8_lossy(&username), &password)
         .unwrap();
     trace!("Sending proof to server...");
@@ -289,20 +291,14 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> (Vec<u8>, Vec<u8>, V
         .unwrap();
     let payload = block_encrypt(&public_key, &ciphertext).unwrap();
     send_data(&payload, stream);
-    trace!("Awaiting strong proof from server...");
+    trace!("Awaiting unlockkey from server...");
     let response = receive_data(stream);
     let cleartext = cipher
         .decrypt(&decryptnonce.into(), response.as_ref())
         .unwrap();
     let encryptnonce = &cleartext[..24];
-    let strong_proof: BigNumber = serde_json::from_slice(&cleartext[24..]).unwrap();
-    strong_proof_verifier
-        .verify_strong_proof(&strong_proof)
-        .unwrap();
-    let mut hasher = Sha3_256::new();
-    hasher.update(strong_proof.to_vec());
-    let magic = hasher.finalize();
-    (magic.to_vec(), encryptnonce.to_vec(), username)
+    let unlockkey = &cleartext[24..];
+    (unlockkey.to_vec(), encryptnonce.to_vec(), username)
 }
 
 fn request(prompt: &str, password: bool) -> String {
