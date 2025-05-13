@@ -221,7 +221,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         .parse::<u32>()
                         .unwrap_or(1000)
             {
-                warn!(
+                trace!(
                     "Client-{} is locked out. Sending errorcode and dropping connection.",
                     id
                 );
@@ -273,7 +273,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     let client_public = match PublicKey::from_sec1_bytes(parsed_data.payload.as_ref()) {
         Ok(data) => data,
         Err(e) => {
-            warn!("Failed to decode client-{} public key: {}", id, e);
+            trace!("Failed to decode client-{} public key: {}", id, e);
             let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
@@ -320,7 +320,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     let ciphertext = match block_decrypt(&private_key, &payload) {
         Ok(data) => data,
         Err(e) => {
-            warn!(
+            trace!(
                 "Client-{} sent invalid bytes. Sending errorcode and dropping connection. {}",
                 id, e
             );
@@ -332,7 +332,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     let cleartext = match cipher.decrypt(&decryptnonce.into(), &ciphertext[..]) {
         Ok(data) => {
             if data.len() <= 24 {
-                warn!(
+                trace!(
                     "Data is too short (username must be at least 1b). Sending errorcode and dropping Client-{}.",
                     id
                 );
@@ -340,7 +340,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             } else if data.len() > 279 {
-                warn!(
+                trace!(
                     "Data is too long (username must be less than 255b). Sending errorcode and dropping Client-{}.",
                     id
                 );
@@ -352,7 +352,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             }
         }
         Err(e) => {
-            warn!(
+            trace!(
                 "Failed to decrypt data from client-{}. Sending errorcode and dropping connection. {}",
                 id, e
             );
@@ -420,7 +420,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 let ciphertext = match block_decrypt(&private_key, &response) {
                     Ok(data) => data,
                     Err(e) => {
-                        warn!(
+                        trace!(
                             "Client-{} sent invalid bytes. Sending errorcode and dropping connection. {}",
                             id, e
                         );
@@ -432,7 +432,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 let payload = match cipher.decrypt(&decryptnonce.into(), &ciphertext[..]) {
                     Ok(data) => data,
                     Err(e) => {
-                        warn!(
+                        trace!(
                             "Failed to decrypt data. Sending errorocode and dropping Client-{}. {}",
                             id, e
                         );
@@ -443,7 +443,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 };
                 match payload.len().cmp(&1048) {
                     Less => {
-                        warn!(
+                        trace!(
                             "Data is too short (expecting 1048b). Sending errorcode and dropping Client-{}.",
                             id
                         );
@@ -452,7 +452,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         return;
                     }
                     Greater => {
-                        warn!(
+                        trace!(
                             "Data is too long (expecting 1048b). Sending errorcode and dropping Client-{}.",
                             id
                         );
@@ -576,7 +576,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 let data = match cipher.decrypt(&decryptnonce.into(), &response[..]) {
                     Ok(data) => {
                         if data.len() <= 24 {
-                            warn!(
+                            trace!(
                                 "Data is too short (username must be at least 1b). Sending errorcode and dropping Client-{}.",
                                 id
                             );
@@ -591,13 +591,13 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 };
                 let nextnonce = &data[..24];
                 if data[24..].to_vec() != (num1 ^ num2).to_le_bytes().to_vec() {
-                    warn!("Client-{} failed verification round {}/7", id, i);
+                    trace!("Client-{} failed verification round {}/7", id, i);
                     failed = true;
                 }
                 encryptnonce = nextnonce.to_vec();
             }
             if failed {
-                warn!(
+                trace!(
                     "Verification failure. Sending vague errorcode, and dropping Client-{}.",
                     id
                 );
@@ -675,7 +675,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let data = match cipher.decrypt(&decryptnonce.into(), &ciphertext[..]) {
                 Ok(data) => {
                     if data.len() <= 24 {
-                        warn!(
+                        trace!(
                             "Data is too short (proof must be at least 1b). Sending errorcode and dropping Client-{}.",
                             id
                         );
@@ -687,7 +687,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     }
                 }
                 Err(e) => {
-                    warn!(
+                    trace!(
                         "Failed to decrypt data. Sending errorocode and dropping Client-{}. {}",
                         id, e
                     );
@@ -701,7 +701,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let proof: HandshakeProof<512, 512> = match serde_json::from_slice(&proof) {
                 Ok(proof) => proof,
                 Err(e) => {
-                    warn!(
+                    trace!(
                         "Failed to deserialize proof. Sending vague errorcode and dropping Client-{}. {}",
                         id, e
                     );
@@ -714,7 +714,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             let (_strong_proof, _session_key_server) = match proof_verifier.verify_proof(&proof) {
                 Ok(proof) => proof,
                 Err(e) => {
-                    warn!("Failed to verify proof. Spoofing Client-{}. {}", id, e);
+                    trace!("Failed to verify proof. Spoofing Client-{}. {}", id, e);
                     verified = false;
                     let mut fluff = [0u8; 32];
                     let mut fluff2 = [0u8; 32];
@@ -901,7 +901,7 @@ async fn srp6_register(
     }
     .is_some()
     {
-        warn!(
+        trace!(
             "Attempting to register a user that already exists. Sending vague errorcode, and dropping Client-{}.",
             id
         );
@@ -953,7 +953,7 @@ async fn get_user_secrets(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
                         .parse::<u32>()
                         .unwrap_or(1000)
             {
-                warn!(
+                trace!(
                     "Client-{} requesting to login to user {:?}, who has been locked out",
                     id, username
                 );
@@ -974,7 +974,7 @@ async fn get_user_secrets(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
             }
         }
         _ => {
-            warn!("Invalid logon session sent by Client-{}", id);
+            trace!("Invalid logon session sent by Client-{}", id);
             let (mut salt, mut verifier) = ([0u8; 256], [0u8; 256]);
             OsRng.try_fill_bytes(&mut salt).unwrap();
             OsRng.try_fill_bytes(&mut verifier).unwrap();

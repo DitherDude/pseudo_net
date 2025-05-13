@@ -64,6 +64,9 @@ fn exchange_keys(stream: &TcpStream, identifier: u8) -> (Vec<u8>, RsaPublicKey, 
     if payload.len() == 4 {
         error_decode(&payload);
     }
+    if payload.len() == 0 {
+        error_decode(&500_i32.to_le_bytes());
+    }
     let server_public =
         PublicKey::from_sec1_bytes(&payload[..65]).expect("Invalid server public key!");
     let shared_secret = client_secret.diffie_hellman(&server_public);
@@ -196,9 +199,10 @@ fn resume_session(
         if response.len() == 4 {
             error_decode(&response);
         }
-        let rawdata = cipher
-            .decrypt(&decryptnonce.into(), response.as_ref())
-            .unwrap();
+        let rawdata = match cipher.decrypt(&decryptnonce.into(), response.as_ref()) {
+            Ok(data) => data,
+            Err(_) => error_decode(&400_i32.to_le_bytes()),
+        };
         encryptnonce = rawdata[..24].to_vec();
         let num1 = u64::from_le_bytes(rawdata[24..32].try_into().unwrap());
         let num2 = u64::from_le_bytes(rawdata[32..40].try_into().unwrap());
@@ -368,7 +372,7 @@ fn choice(prompt: &str, yes: &str, no: &str) -> bool {
     }
 }
 
-fn error_decode(code: &[u8]) {
+fn error_decode(code: &[u8]) -> Vec<u8> {
     let ec = i32::from_le_bytes(code[..4].try_into().unwrap());
     let msg = match ec {
         400 => "Client fault (thats us!). Server refused to elaborate what went wrong.",
