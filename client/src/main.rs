@@ -9,7 +9,7 @@ use sha3::{Digest, Sha3_256, digest::generic_array::GenericArray};
 use srp6::prelude::*;
 use std::process::exit;
 use std::{
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
     net::TcpStream,
     vec,
 };
@@ -40,9 +40,14 @@ fn main() {
         return;
     };
     info!("Connected to {}", SERVER);
-    //
-    new_session(&stream);
-    //resume_session(&stream);
+    let token = get_token();
+    if token.is_empty() {
+        new_session(&stream);
+    } else {
+        let token = &token[..256];
+        let username = &token[256..];
+        resume_session(&stream, Some(username), token);
+    }
 }
 
 fn exchange_keys(stream: &TcpStream, identifier: u8) -> (Vec<u8>, RsaPublicKey, Vec<u8>) {
@@ -137,33 +142,22 @@ fn new_session(stream: &TcpStream) {
             error_decode(&response);
         }
         let cleartext = cipher.decrypt(&decryptnonce.into(), &response[..]).unwrap();
-        let encryptnonce = &cleartext[..24];
+        //let encryptnonce = &cleartext[..24];
         let key = &cleartext[24..];
         trace!("Registration successful. Creating a new session to server, and logging in.");
-        resume_session(
-            &TcpStream::connect(&serverip).unwrap(),
-            Some(username),
-            key,
-            encryptnonce,
-        );
+        resume_session(&TcpStream::connect(&serverip).unwrap(), Some(username), key);
     } else {
-        let (key, encryptnonce, username) =
+        let (key, _encryptnonce, username) =
             login(&TcpStream::connect(&serverip).unwrap(), Some(username));
         resume_session(
             &TcpStream::connect(&serverip).unwrap(),
             Some(&username),
             &key,
-            &encryptnonce,
         );
     };
 }
 
-fn resume_session(
-    stream: &TcpStream,
-    usernameraw: Option<&[u8]>,
-    unlockkey: &[u8],
-    nextnonce: &[u8],
-) {
+fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, unlockkey: &[u8]) {
     let mut rng = OsRng;
     debug!("Resume session requested.");
     let username = match usernameraw {
@@ -173,9 +167,9 @@ fn resume_session(
             request("Username: ", false).into_bytes()
         }
     };
-    let (mut encryptnonce, public_key, rawkeybytes) = exchange_keys(stream, 1u8);
+    let (encryptnonce, public_key, rawkeybytes) = exchange_keys(stream, 1u8);
     trace!(
-        "Sending decryptnonce (24b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
+        "Sending decryptnonce (24b) + token (256b) + username (?b) encryped via shared secret through the RSA-2048 public key..."
     );
     let key = GenericArray::from_slice(&rawkeybytes);
     let cipher = XChaCha20Poly1305::new(key);
@@ -183,38 +177,14 @@ fn resume_session(
     rng.try_fill_bytes(&mut decryptnonce).unwrap();
     let mut cleartext = Vec::new();
     cleartext.extend_from_slice(&decryptnonce);
+    cleartext.extend_from_slice(unlockkey);
     cleartext.extend_from_slice(&username);
     let ciphertext = cipher
         .encrypt(GenericArray::from_slice(&encryptnonce), cleartext.as_ref())
         .unwrap();
     let payload = block_encrypt(&public_key, &ciphertext).unwrap();
     send_data(&payload, stream);
-    let mut hasher = Sha3_256::new();
-    hasher.update(unlockkey);
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&hasher.finalize()));
-    decryptnonce = nextnonce.try_into().unwrap();
-    trace!("Awaiting sum from server ...");
-    let response = receive_data(stream);
-    if response.len() == 4 {
-        error_decode(&response);
-    }
-    let rawdata = match cipher.decrypt(&decryptnonce.into(), response.as_ref()) {
-        Ok(data) => data,
-        Err(_) => error_decode(&400_i32.to_le_bytes()),
-    };
-    encryptnonce = rawdata[..24].to_vec();
-    let num1 = u64::from_le_bytes(rawdata[24..32].try_into().unwrap());
-    let num2 = u64::from_le_bytes(rawdata[32..40].try_into().unwrap());
-    let sum = num1 ^ num2;
-    rng.try_fill_bytes(&mut decryptnonce).unwrap();
-    let mut data = Vec::new();
-    data.extend_from_slice(&decryptnonce);
-    data.extend_from_slice(&sum.to_le_bytes());
-    let payload = cipher
-        .encrypt(GenericArray::from_slice(&encryptnonce), data.as_ref())
-        .unwrap();
-    trace!("returning XOR result... ");
-    send_data(&payload, stream);
+    trace!("Awaiting response from server ...");
     let payload = receive_data(stream);
     if payload.len() == 4 {
         error_decode(&payload);
@@ -383,4 +353,14 @@ fn error_decode(code: &[u8]) -> Vec<u8> {
     };
     error!("{}", msg);
     exit(ec);
+}
+
+fn get_token() -> Vec<u8> {
+    if std::fs::metadata("token").is_err() {
+        return Vec::new();
+    }
+    let mut file = std::fs::File::open("token").unwrap();
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).unwrap_or_default();
+    contents
 }
