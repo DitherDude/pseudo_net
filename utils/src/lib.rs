@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
 };
-use tracing::{debug, error, trace};
+use tracing::{debug, trace};
 
 pub fn receive_data(mut stream: &TcpStream) -> Vec<u8> {
     trace!("Started receiving data.");
@@ -13,7 +13,7 @@ pub fn receive_data(mut stream: &TcpStream) -> Vec<u8> {
         match stream.read_exact(&mut len) {
             Ok(_) => {}
             Err(e) => {
-                error!("Failed to read block length: {}", e);
+                trace!("Failed to read block length: {}", e);
                 return data;
             }
         }
@@ -44,7 +44,7 @@ pub fn send_data(payload: &[u8], mut stream: &TcpStream) {
         match stream.write_all(&message_len.to_le_bytes()) {
             Ok(_) => {}
             Err(e) => {
-                error!("Failed to send block length: {}", e);
+                trace!("Failed to send block length: {}", e);
                 return;
             }
         }
@@ -52,7 +52,7 @@ pub fn send_data(payload: &[u8], mut stream: &TcpStream) {
         match stream.write_all(block) {
             Ok(_) => {}
             Err(e) => {
-                error!("Failed to send block: {}", e);
+                trace!("Failed to send block: {}", e);
                 return;
             }
         }
@@ -62,7 +62,7 @@ pub fn send_data(payload: &[u8], mut stream: &TcpStream) {
         match stream.write_all(&0u16.to_le_bytes()) {
             Ok(_) => {}
             Err(e) => {
-                error!("Failed to send null terminator: {}", e);
+                trace!("Failed to send null terminator: {}", e);
             }
         }
     }
