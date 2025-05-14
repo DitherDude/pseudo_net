@@ -170,7 +170,13 @@ async fn main() {
         }
     };
     let port = retreive_config("PORT").parse::<u16>().unwrap_or(15496);
-    let listener = TcpListener::bind("127.0.0.1:".to_owned() + &port.to_string()).unwrap();
+    let listener = match TcpListener::bind("127.0.0.1:".to_owned() + &port.to_string()) {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("Port is busy! {}", e);
+            return;
+        }
+    };
     info!("Server listening on 127.0.0.1:{}", port);
     let mut connid = 0usize;
     for stream in listener.incoming() {
@@ -227,7 +233,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             }
         }
         Err(e) => {
-            warn!(
+            debug!(
                 "Internal error! Sending errorcode to Client-{} and dropping connection. {}",
                 id, e
             );
@@ -374,7 +380,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             {
                 Ok(Some(data)) => data.count,
                 Ok(None) => {
-                    warn!(
+                    debug!(
                         "Unexpected response from database. Sending errorocode and dropping Client-{}.",
                         id
                     );
@@ -478,7 +484,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             plaintext.extend_from_slice(&match token {
                             Some(data) => data,
                             None => {
-                                warn!(
+                                debug!(
                                     "Failed to generate token. Sending errorcode and dropping Client-{}.",
                                     id
                                 );
@@ -507,7 +513,8 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 Ok(data) => {
                     if data.len() <= 280 {
                         debug!(
-                            "Data is too short (key should be 256b, and username must be at least 1b). Sending errorcode and dropping Client-{}.",
+                            "Data is too short (key should be 256b, and username must be at least 1b). {}. Sending errorcode and dropping Client-{}.",
+                            data.len(),
                             id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
@@ -551,7 +558,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             {
                 Ok(Some(data)) => data.count,
                 Ok(None) => {
-                    warn!(
+                    debug!(
                         "Unexpected response from database. Sending errorocode and dropping Client-{}.",
                         id
                     );
@@ -596,7 +603,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 }
             };
             if token != usertoken {
-                warn!(
+                debug!(
                     "Token mismatch for user {:?}. Dropping Client-{}.",
                     username, id
                 );
@@ -615,7 +622,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 .await
                 .is_none()
                 {
-                    warn!("Failed to penalise user.");
+                    debug!("Failed to penalise user.");
                 }
                 if client_penalise(
                     &clientip,
@@ -627,7 +634,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 .await
                 .is_none()
                 {
-                    warn!("Failed to penalise client.");
+                    debug!("Failed to penalise client.");
                 }
                 send_data(&501_i32.to_le_bytes(), &stream);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -645,7 +652,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             .await
             .is_none()
             {
-                warn!("Failed to forgive user.");
+                debug!("Failed to forgive user.");
             }
             if client_penalise(
                 &clientip,
@@ -657,7 +664,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             .await
             .is_none()
             {
-                warn!("Failed to forgive client.");
+                debug!("Failed to forgive client.");
             }
         }
         2 => {
@@ -708,7 +715,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             {
                 Ok(Some(data)) => data.count,
                 Ok(None) => {
-                    warn!(
+                    debug!(
                         "Unexpected response from database. Sending errorocode and dropping Client-{}.",
                         id
                     );
@@ -809,7 +816,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     .await
                     .is_none()
                     {
-                        warn!("Failed to penalise user.");
+                        debug!("Failed to penalise user.");
                     }
                     if client_penalise(
                         &clientip,
@@ -821,7 +828,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     .await
                     .is_none()
                     {
-                        warn!("Failed to penalise client.");
+                        debug!("Failed to penalise client.");
                     }
                     (BigNumber::from(fluff), BigNumber::from(fluff2))
                 }
@@ -836,20 +843,20 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     {
                         Ok(data) => match data {
                             Some(data) => data.nonce.unwrap_or_else(|| {
-                                warn!("Database error!");
+                                debug!("Database error!");
                                 let mut fluff = [0u8; 24];
                                 rng.try_fill_bytes(&mut fluff).unwrap();
                                 fluff.to_vec()
                             }),
                             None => {
-                                warn!("Database error!");
+                                debug!("Database error!");
                                 let mut fluff = [0u8; 24];
                                 rng.try_fill_bytes(&mut fluff).unwrap();
                                 fluff.to_vec()
                             }
                         },
-                        Err(_) => {
-                            warn!("Failed to query database.");
+                        Err(e) => {
+                            warn!("Failed to query database. {}", e);
                             let mut fluff = [0u8; 24];
                             rng.try_fill_bytes(&mut fluff).unwrap();
                             fluff.to_vec()
@@ -1135,12 +1142,12 @@ async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option
         Ok(data) => match data {
             Some(data) => data.danger,
             None => {
-                warn!("Database error!");
+                debug!("Database error!");
                 return None;
             }
         },
-        Err(_) => {
-            warn!("Failed to query database.");
+        Err(e) => {
+            warn!("Failed to query database. {}", e);
             return None;
         }
     };
@@ -1157,8 +1164,8 @@ async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option
             .await
             {
                 Ok(_) => Some(new),
-                Err(_) => {
-                    warn!("Failed to query database.");
+                Err(e) => {
+                    warn!("Failed to query database. {}", e);
                     None
                 }
             }
@@ -1174,8 +1181,8 @@ async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option
             .await
             {
                 Ok(_) => Some(new),
-                Err(_) => {
-                    warn!("Failed to query database.");
+                Err(e) => {
+                    warn!("Failed to query database. {}", e);
                     None
                 }
             }
@@ -1202,15 +1209,15 @@ async fn client_penalise(client: &str, pool: &MySqlPool, amount: i32) -> Option<
                 .await
                 {
                     Ok(_) => 0,
-                    Err(_) => {
-                        warn!("Failed to insert client!");
+                    Err(e) => {
+                        warn!("Failed to insert client! {}", e);
                         return None;
                     }
                 }
             }
         },
-        Err(_) => {
-            warn!("Failed to query database.");
+        Err(e) => {
+            warn!("Failed to query database. {}", e);
             return None;
         }
     };
@@ -1227,8 +1234,8 @@ async fn client_penalise(client: &str, pool: &MySqlPool, amount: i32) -> Option<
             .await
             {
                 Ok(_) => Some(new),
-                Err(_) => {
-                    warn!("Failed to query database.");
+                Err(e) => {
+                    warn!("Failed to query database. {}", e);
                     None
                 }
             }
@@ -1244,8 +1251,8 @@ async fn client_penalise(client: &str, pool: &MySqlPool, amount: i32) -> Option<
             .await
             {
                 Ok(_) => Some(new),
-                Err(_) => {
-                    warn!("Failed to query database.");
+                Err(e) => {
+                    warn!("Failed to query database. {}", e);
                     None
                 }
             }

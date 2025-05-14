@@ -13,7 +13,7 @@ use std::{
     net::TcpStream,
     vec,
 };
-use tracing::{Level, debug, error, info, trace};
+use tracing::{Level, debug, error, info, trace, warn};
 use utils::{block_encrypt, receive_data, send_data};
 const SERVER: &str = "127.0.0.1:15496";
 fn main() {
@@ -44,9 +44,9 @@ fn main() {
     if token.is_empty() {
         new_session(&stream);
     } else {
-        let token = &token[..256];
+        let unlockkey = &token[..256];
         let username = &token[256..];
-        resume_session(&stream, Some(username), token);
+        resume_session(&stream, Some(username), unlockkey);
     }
 }
 
@@ -144,11 +144,13 @@ fn new_session(stream: &TcpStream) {
         let cleartext = cipher.decrypt(&decryptnonce.into(), &response[..]).unwrap();
         //let encryptnonce = &cleartext[..24];
         let key = &cleartext[24..];
+        set_token(key, username);
         trace!("Registration successful. Creating a new session to server, and logging in.");
         resume_session(&TcpStream::connect(&serverip).unwrap(), Some(username), key);
     } else {
         let (key, _encryptnonce, username) =
             login(&TcpStream::connect(&serverip).unwrap(), Some(username));
+        set_token(&key, &username);
         resume_session(
             &TcpStream::connect(&serverip).unwrap(),
             Some(&username),
@@ -363,4 +365,23 @@ fn get_token() -> Vec<u8> {
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).unwrap_or_default();
     contents
+}
+
+fn set_token(token: &[u8], username: &[u8]) {
+    let mut file = match std::fs::File::create("token") {
+        Ok(file) => file,
+        Err(e) => {
+            warn!("Error creating token file! {}", e);
+            return;
+        }
+    };
+    let mut data = Vec::new();
+    data.extend_from_slice(token);
+    data.extend_from_slice(username);
+    match file.write_all(&data) {
+        Ok(_) => {}
+        Err(e) => {
+            warn!("Error writing to token file! {}", e);
+        }
+    }
 }
