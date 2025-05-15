@@ -508,16 +508,16 @@ async fn handle_connection(stream: TcpStream, id: usize) {
         1 => {
             let cleartext = match cipher.decrypt(&decryptnonce.into(), &ciphertext[..]) {
                 Ok(data) => {
-                    if data.len() <= 280 {
+                    if data.len() <= 88 {
                         debug!(
-                            "Data is too short (key should be 256b, and username must be at least 1b). {}. Sending errorcode and dropping Client-{}.",
+                            "Data is too short (key should be 64b, and username must be at least 1b). {}. Sending errorcode and dropping Client-{}.",
                             data.len(),
                             id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
-                    } else if data.len() > 535 {
+                    } else if data.len() > 343 {
                         debug!(
                             "Data is too long (username must be less than 255b). Sending errorcode and dropping Client-{}.",
                             id
@@ -540,8 +540,8 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 }
             };
             let mut failed = false;
-            let usertoken = &cleartext[24..280];
-            let username = &cleartext[280..];
+            let usertoken = &cleartext[24..88];
+            let username = &cleartext[88..];
             trace!(
                 "Checking if Client-{}'s requested user \"{:?}\" exists.",
                 id, &username
@@ -594,7 +594,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         username, id
                     );
                     failed = true;
-                    let mut fluff = [0u8; 256];
+                    let mut fluff = [0u8; 64];
                     rng.try_fill_bytes(&mut fluff).unwrap();
                     fluff.to_vec()
                 }
@@ -854,7 +854,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 get_user_token(username, &pool).await.unwrap_or_default()
             } else {
                 debug!("Generating spoof key for Client-{}...", id);
-                let mut fluff = [0u8; 256];
+                let mut fluff = [0u8; 64];
                 rng.try_fill_bytes(&mut fluff).unwrap();
                 fluff.to_vec()
             };
