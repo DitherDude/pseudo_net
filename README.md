@@ -42,7 +42,7 @@ user:
 `forgive`: Controls how many penalty points the client/user is awarded on successful login attempt.
 
 > [!NOTE]
-> `forgive` is negative as we wish to inverse the penalty given in the above instance. `forgive` is usually greater (absolute comparison) than `penalty` to not be too harsh on the user, who is likely to type the password incorrectly at some point. 
+> `forgive` is negative as we wish to inverse the penalty awarded on a failed login attempt. `forgive` is usually greater (absolute comparison) than `penalty` to not be too harsh on the user, who is likely to type the password incorrectly at some point. 
 
 `lockout`: Controls the minimum amount of penalty points a client/user must have to be locked out.
 
