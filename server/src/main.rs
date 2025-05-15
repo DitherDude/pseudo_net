@@ -2,13 +2,16 @@ use chacha20poly1305::{
     XChaCha20Poly1305,
     aead::{Aead, KeyInit, OsRng},
 };
+use figment::{
+    Figment,
+    providers::{Format, Yaml},
+};
 use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey, rand_core::RngCore};
 use sha3::{Digest, Sha3_256, Sha3_512};
 use sqlx::mysql::MySqlPool;
 use srp6::prelude::*;
 use std::cmp::Ordering::{Equal, Greater, Less};
-use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::process::exit;
 use tracing::{Level, debug, error, info, trace, warn};
@@ -39,7 +42,12 @@ async fn main() {
         exit(1);
     }
     trace!("Testing MYSQL connection...");
-    match MySqlPool::connect(&retreive_config("PATH")).await {
+    match MySqlPool::connect(&retreive_config::<String>("path").unwrap_or_else(|| {
+        error!("Failed to query config yaml. Please see docs on how to create a config file.");
+        exit(1);
+    }))
+    .await
+    {
         Ok(pool) => {
             trace!("Checking users table schema...");
             match sqlx::query!(
@@ -169,7 +177,7 @@ async fn main() {
             exit(1);
         }
     };
-    let port = retreive_config("PORT").parse::<u16>().unwrap_or(15496);
+    let port = retreive_config("port").unwrap_or(15496);
     let listener = match TcpListener::bind("127.0.0.1:".to_owned() + &port.to_string()) {
         Ok(listener) => listener,
         Err(e) => {
@@ -202,7 +210,9 @@ async fn main() {
 
 async fn handle_connection(stream: TcpStream, id: usize) {
     let clientip = stream.peer_addr().unwrap().ip().to_string();
-    let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
+    let pool = MySqlPool::connect(&retreive_config::<String>("path").unwrap())
+        .await
+        .unwrap();
     match sqlx::query!(
         r#"
         SELECT
@@ -218,10 +228,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     {
         Ok(Some(data)) => {
             if data.locked == 1
-                || data.penalty
-                    > retreive_config("CLIENT-LOCKOUT")
-                        .parse::<u32>()
-                        .unwrap_or(1000)
+                || data.penalty > retreive_config::<u32>("client.lockout").unwrap_or(1000)
             {
                 debug!(
                     "Client-{} is locked out. Sending errorcode and dropping connection.",
@@ -607,7 +614,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 if user_penalise(
                     username,
                     &pool,
-                    retreive_config("USER-PENALTY").parse::<i32>().unwrap_or(50),
+                    retreive_config::<i32>("user.penalty").unwrap_or(50),
                 )
                 .await
                 .is_none()
@@ -617,9 +624,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 if client_penalise(
                     &clientip,
                     &pool,
-                    retreive_config("CLIENT-PENALTY")
-                        .parse::<i32>()
-                        .unwrap_or(50),
+                    retreive_config::<i32>("client.penalty").unwrap_or(50),
                 )
                 .await
                 .is_none()
@@ -635,9 +640,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             if user_penalise(
                 username,
                 &pool,
-                retreive_config("SERVER-FORGIVE")
-                    .parse::<i32>()
-                    .unwrap_or(-100),
+                retreive_config::<i32>("user.forgive").unwrap_or(-100),
             )
             .await
             .is_none()
@@ -647,9 +650,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             if client_penalise(
                 &clientip,
                 &pool,
-                retreive_config("CLIENT-FORGIVE")
-                    .parse::<i32>()
-                    .unwrap_or(-100),
+                retreive_config::<i32>("client.forgive").unwrap_or(-100),
             )
             .await
             .is_none()
@@ -801,7 +802,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     if user_penalise(
                         username,
                         &pool,
-                        retreive_config("USER-PENALTY").parse::<i32>().unwrap_or(50),
+                        retreive_config::<i32>("user.penalty").unwrap_or(50),
                     )
                     .await
                     .is_none()
@@ -811,9 +812,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     if client_penalise(
                         &clientip,
                         &pool,
-                        retreive_config("CLIENT-PENALTY")
-                            .parse::<i32>()
-                            .unwrap_or(50),
+                        retreive_config::<i32>("client.penalty").unwrap_or(50),
                     )
                     .await
                     .is_none()
@@ -881,7 +880,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
 }
 
 fn generate_keys(id: usize) -> (RsaPrivateKey, RsaPublicKey) {
-    let bits = retreive_config("BITS").parse::<usize>().unwrap_or(2048);
+    let bits = retreive_config::<usize>("bits").unwrap_or(2048);
     trace!("Generating keys for Client-{}...", id);
     let mut rng = OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, bits).unwrap();
@@ -906,24 +905,6 @@ fn parse_data(data: &[u8]) -> Result<DataParser, &'static str> {
         indentifier: data[0],
         payload: data[1..].to_vec(),
     })
-}
-
-fn retreive_config(path: &str) -> String {
-    if std::fs::metadata("config").is_err() {
-        error!("Config file not found!");
-        exit(1);
-    }
-    let mut file = std::fs::File::open("config").unwrap();
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-    let mut lookup = path.to_string();
-    lookup.push(':');
-    for line in contents.lines() {
-        if line.starts_with(&lookup) {
-            return line.replace(&lookup, "").trim().to_string();
-        }
-    }
-    String::new()
 }
 
 async fn srp6_register(
@@ -1024,10 +1005,7 @@ async fn get_user_secrets(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
     {
         Ok(Some(data)) => {
             if data.locked == 1
-                || data.danger
-                    > retreive_config("USER-LOCKOUT")
-                        .parse::<u32>()
-                        .unwrap_or(1000)
+                || data.danger > retreive_config::<u32>("user.lockout").unwrap_or(1000)
             {
                 trace!(
                     "Client-{} requesting to login to user {:?}, who has been locked out",
@@ -1244,6 +1222,17 @@ async fn client_penalise(client: &str, pool: &MySqlPool, amount: i32) -> Option<
                     None
                 }
             }
+        }
+    }
+}
+
+fn retreive_config<'x, T: serde::de::Deserialize<'x>>(fig: &str) -> Option<T> {
+    let figment = Figment::new().merge(Yaml::file("config.yml"));
+    match figment.extract_inner(fig) {
+        Ok(data) => Some(data),
+        Err(e) => {
+            debug!("Failed to query config yaml. {}", e);
+            None
         }
     }
 }
