@@ -476,7 +476,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         rng.try_fill_bytes(&mut decryptnonce).unwrap();
                         let mut plaintext = Vec::new();
                         if srp6_register(username, &pool, &stream, salt, verifier, id).await {
-                            let token = get_user_token(username, &pool, &clientip).await;
+                            let token = get_user_token(username, &pool).await;
                             plaintext.extend_from_slice(&decryptnonce);
                             plaintext.extend_from_slice(&match token {
                             Some(data) => data,
@@ -583,7 +583,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             }
-            let token = match get_user_token(username, &pool, &clientip).await {
+            let token = match get_user_token(username, &pool).await {
                 Some(data) => {
                     trace!("Got token for user {:?}.", username);
                     data
@@ -851,9 +851,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             fluff.to_vec()
                         }
                     };
-                get_user_token(username, &pool, &clientip)
-                    .await
-                    .unwrap_or_default()
+                get_user_token(username, &pool).await.unwrap_or_default()
             } else {
                 debug!("Generating spoof key for Client-{}...", id);
                 let mut fluff = [0u8; 256];
@@ -1041,7 +1039,7 @@ async fn get_user_secrets(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
     }
 }
 
-async fn get_user_token(username: &[u8], pool: &MySqlPool, client: &str) -> Option<Vec<u8>> {
+async fn get_user_token(username: &[u8], pool: &MySqlPool) -> Option<Vec<u8>> {
     let (userid, salt, verifier, magic) = match sqlx::query!(
         "SELECT userid, salt, verifier, magic FROM users WHERE username = ?",
         username
@@ -1052,52 +1050,16 @@ async fn get_user_token(username: &[u8], pool: &MySqlPool, client: &str) -> Opti
         Ok(Some(data)) => (data.userid, data.salt, data.verifier, data.magic),
         _ => return None,
     };
-    let mut user = Vec::new();
-    user.extend_from_slice(username);
-    user.extend_from_slice(client.as_bytes());
-    user.extend_from_slice(&userid);
-    let mut hash1 = Sha3_512::new();
-    let mut hash2 = Sha3_512::new();
-    let mut hash3 = Sha3_512::new();
-    let mut hash4 = Sha3_512::new();
-    hash1.update(&salt);
-    hash2.update(&verifier);
-    hash3.update(&user);
-    hash4.update(magic.unwrap_or_default());
-    let keys = [
-        &hash1.finalize(),
-        &hash2.finalize(),
-        &hash3.finalize(),
-        &hash4.finalize(),
-    ];
-    let mut newkeys = [
-        vec![u8::default()],
-        vec![u8::default()],
-        vec![u8::default()],
-        vec![u8::default()],
-    ];
-    for key in keys {
-        for i in 0..key.len() / 4 {
-            newkeys[0].push(key[i * 4]);
-            newkeys[1].push(key[i * 4 + 1]);
-            newkeys[2].push(key[i * 4 + 2]);
-            newkeys[3].push(key[i * 4 + 3]);
-        }
-    }
-    let mut hash1 = Sha3_512::new();
-    let mut hash2 = Sha3_512::new();
-    let mut hash3 = Sha3_512::new();
-    let mut hash4 = Sha3_512::new();
-    let mut data = Vec::new();
-    hash1.update(&newkeys[0]);
-    hash2.update(&newkeys[1]);
-    hash3.update(&newkeys[2]);
-    hash4.update(&newkeys[3]);
-    data.extend_from_slice(&hash1.finalize());
-    data.extend_from_slice(&hash2.finalize());
-    data.extend_from_slice(&hash3.finalize());
-    data.extend_from_slice(&hash4.finalize());
-    Some(data)
+    let mut cleartext = Vec::new();
+    cleartext.extend_from_slice(username);
+    cleartext.extend_from_slice(&userid);
+    cleartext.extend_from_slice(&salt);
+    cleartext.extend_from_slice(&verifier);
+    cleartext.extend_from_slice(&magic.unwrap_or_default());
+    let mut hash = Sha3_512::new();
+    hash.update(&cleartext);
+    let token = hash.finalize();
+    Some(token.to_vec())
 }
 
 async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option<u32> {
