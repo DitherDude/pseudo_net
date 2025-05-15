@@ -468,17 +468,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         let verifier = &payload[536..1048];
                         rng.try_fill_bytes(&mut decryptnonce).unwrap();
                         let mut plaintext = Vec::new();
-                        if srp6_register(
-                            username,
-                            &pool,
-                            &stream,
-                            salt,
-                            verifier,
-                            &decryptnonce,
-                            id,
-                        )
-                        .await
-                        {
+                        if srp6_register(username, &pool, &stream, salt, verifier, id).await {
                             let token = get_user_token(username, &pool, &clientip).await;
                             plaintext.extend_from_slice(&decryptnonce);
                             plaintext.extend_from_slice(&match token {
@@ -942,7 +932,6 @@ async fn srp6_register(
     stream: &TcpStream,
     salt: &[u8],
     verifier: &[u8],
-    decryptnonce: &[u8],
     id: usize,
 ) -> bool {
     let mut rng = OsRng;
@@ -999,14 +988,13 @@ async fn srp6_register(
     }
     match sqlx::query!(
         r#"
-        INSERT INTO users ( userid, username, salt, verifier, nonce, magic )
-        VALUES ( ?, ?, ?, ?, ?, ? )
+        INSERT INTO users ( userid, username, salt, verifier, magic )
+        VALUES ( ?, ?, ?, ?, ? )
         "#,
         &userid[..],
         username,
         salt,
         verifier,
-        decryptnonce,
         &magic[..]
     )
     .execute(pool)
