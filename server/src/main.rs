@@ -37,7 +37,7 @@ async fn main() {
         tracing_subscriber::fmt().init();
     });
     trace!("Looking for config file...");
-    if std::fs::metadata("config").is_err() {
+    if std::fs::metadata("config.yml").is_err() {
         error!("Config file not found! Please see docs on how to create a config file.");
         exit(1);
     }
