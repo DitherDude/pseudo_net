@@ -2,13 +2,16 @@ use chacha20poly1305::{
     XChaCha20Poly1305,
     aead::{Aead, KeyInit, OsRng},
 };
+use figment::{
+    Figment,
+    providers::{Format, Yaml},
+};
 use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey, rand_core::RngCore};
 use sha3::{Digest, Sha3_256, Sha3_512};
 use sqlx::mysql::MySqlPool;
 use srp6::prelude::*;
 use std::cmp::Ordering::{Equal, Greater, Less};
-use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::process::exit;
 use tracing::{Level, debug, error, info, trace, warn};
@@ -34,12 +37,17 @@ async fn main() {
         tracing_subscriber::fmt().init();
     });
     trace!("Looking for config file...");
-    if std::fs::metadata("config").is_err() {
+    if std::fs::metadata("config.yml").is_err() {
         error!("Config file not found! Please see docs on how to create a config file.");
         exit(1);
     }
     trace!("Testing MYSQL connection...");
-    match MySqlPool::connect(&retreive_config("PATH")).await {
+    match MySqlPool::connect(&retreive_config::<String>("path").unwrap_or_else(|| {
+        error!("Failed to query config yaml. Please see docs on how to create a config file.");
+        exit(1);
+    }))
+    .await
+    {
         Ok(pool) => {
             trace!("Checking users table schema...");
             match sqlx::query!(
@@ -169,7 +177,7 @@ async fn main() {
             exit(1);
         }
     };
-    let port = retreive_config("PORT").parse::<u16>().unwrap_or(15496);
+    let port = retreive_config("port").unwrap_or(15496);
     let listener = match TcpListener::bind("127.0.0.1:".to_owned() + &port.to_string()) {
         Ok(listener) => listener,
         Err(e) => {
@@ -202,7 +210,9 @@ async fn main() {
 
 async fn handle_connection(stream: TcpStream, id: usize) {
     let clientip = stream.peer_addr().unwrap().ip().to_string();
-    let pool = MySqlPool::connect(&retreive_config("PATH")).await.unwrap();
+    let pool = MySqlPool::connect(&retreive_config::<String>("path").unwrap())
+        .await
+        .unwrap();
     match sqlx::query!(
         r#"
         SELECT
@@ -218,10 +228,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
     {
         Ok(Some(data)) => {
             if data.locked == 1
-                || data.penalty
-                    > retreive_config("CLIENT-LOCKOUT")
-                        .parse::<u32>()
-                        .unwrap_or(1000)
+                || data.penalty > retreive_config::<u32>("client.lockout").unwrap_or(1000)
             {
                 debug!(
                     "Client-{} is locked out. Sending errorcode and dropping connection.",
@@ -469,7 +476,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         rng.try_fill_bytes(&mut decryptnonce).unwrap();
                         let mut plaintext = Vec::new();
                         if srp6_register(username, &pool, &stream, salt, verifier, id).await {
-                            let token = get_user_token(username, &pool, &clientip).await;
+                            let token = get_user_token(username, &pool).await;
                             plaintext.extend_from_slice(&decryptnonce);
                             plaintext.extend_from_slice(&match token {
                             Some(data) => data,
@@ -501,16 +508,16 @@ async fn handle_connection(stream: TcpStream, id: usize) {
         1 => {
             let cleartext = match cipher.decrypt(&decryptnonce.into(), &ciphertext[..]) {
                 Ok(data) => {
-                    if data.len() <= 280 {
+                    if data.len() <= 88 {
                         debug!(
-                            "Data is too short (key should be 256b, and username must be at least 1b). {}. Sending errorcode and dropping Client-{}.",
+                            "Data is too short (key should be 64b, and username must be at least 1b). {}. Sending errorcode and dropping Client-{}.",
                             data.len(),
                             id
                         );
                         send_data(&401_i32.to_le_bytes(), &stream);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
-                    } else if data.len() > 535 {
+                    } else if data.len() > 343 {
                         debug!(
                             "Data is too long (username must be less than 255b). Sending errorcode and dropping Client-{}.",
                             id
@@ -533,8 +540,8 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 }
             };
             let mut failed = false;
-            let usertoken = &cleartext[24..280];
-            let username = &cleartext[280..];
+            let usertoken = &cleartext[24..88];
+            let username = &cleartext[88..];
             trace!(
                 "Checking if Client-{}'s requested user \"{:?}\" exists.",
                 id, &username
@@ -576,7 +583,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return;
             }
-            let token = match get_user_token(username, &pool, &clientip).await {
+            let token = match get_user_token(username, &pool).await {
                 Some(data) => {
                     trace!("Got token for user {:?}.", username);
                     data
@@ -587,7 +594,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         username, id
                     );
                     failed = true;
-                    let mut fluff = [0u8; 256];
+                    let mut fluff = [0u8; 64];
                     rng.try_fill_bytes(&mut fluff).unwrap();
                     fluff.to_vec()
                 }
@@ -607,7 +614,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 if user_penalise(
                     username,
                     &pool,
-                    retreive_config("USER-PENALTY").parse::<i32>().unwrap_or(50),
+                    retreive_config::<i32>("user.penalty").unwrap_or(50),
                 )
                 .await
                 .is_none()
@@ -617,9 +624,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                 if client_penalise(
                     &clientip,
                     &pool,
-                    retreive_config("CLIENT-PENALTY")
-                        .parse::<i32>()
-                        .unwrap_or(50),
+                    retreive_config::<i32>("client.penalty").unwrap_or(50),
                 )
                 .await
                 .is_none()
@@ -635,9 +640,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             if user_penalise(
                 username,
                 &pool,
-                retreive_config("SERVER-FORGIVE")
-                    .parse::<i32>()
-                    .unwrap_or(-100),
+                retreive_config::<i32>("user.forgive").unwrap_or(-100),
             )
             .await
             .is_none()
@@ -647,9 +650,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             if client_penalise(
                 &clientip,
                 &pool,
-                retreive_config("CLIENT-FORGIVE")
-                    .parse::<i32>()
-                    .unwrap_or(-100),
+                retreive_config::<i32>("client.forgive").unwrap_or(-100),
             )
             .await
             .is_none()
@@ -812,7 +813,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     if user_penalise(
                         username,
                         &pool,
-                        retreive_config("USER-PENALTY").parse::<i32>().unwrap_or(50),
+                        retreive_config::<i32>("user.penalty").unwrap_or(50),
                     )
                     .await
                     .is_none()
@@ -822,9 +823,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     if client_penalise(
                         &clientip,
                         &pool,
-                        retreive_config("CLIENT-PENALTY")
-                            .parse::<i32>()
-                            .unwrap_or(50),
+                        retreive_config::<i32>("client.penalty").unwrap_or(50),
                     )
                     .await
                     .is_none()
@@ -863,12 +862,10 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             fluff.to_vec()
                         }
                     };
-                get_user_token(username, &pool, &clientip)
-                    .await
-                    .unwrap_or_default()
+                get_user_token(username, &pool).await.unwrap_or_default()
             } else {
                 debug!("Generating spoof key for Client-{}...", id);
-                let mut fluff = [0u8; 256];
+                let mut fluff = [0u8; 64];
                 rng.try_fill_bytes(&mut fluff).unwrap();
                 fluff.to_vec()
             };
@@ -892,7 +889,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
 }
 
 fn generate_keys(id: usize) -> (RsaPrivateKey, RsaPublicKey) {
-    let bits = retreive_config("BITS").parse::<usize>().unwrap_or(2048);
+    let bits = retreive_config::<usize>("bits").unwrap_or(2048);
     trace!("Generating keys for Client-{}...", id);
     let mut rng = OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, bits).unwrap();
@@ -917,24 +914,6 @@ fn parse_data(data: &[u8]) -> Result<DataParser, &'static str> {
         indentifier: data[0],
         payload: data[1..].to_vec(),
     })
-}
-
-fn retreive_config(path: &str) -> String {
-    if std::fs::metadata("config").is_err() {
-        error!("Config file not found!");
-        exit(1);
-    }
-    let mut file = std::fs::File::open("config").unwrap();
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-    let mut lookup = path.to_string();
-    lookup.push(':');
-    for line in contents.lines() {
-        if line.starts_with(&lookup) {
-            return line.replace(&lookup, "").trim().to_string();
-        }
-    }
-    String::new()
 }
 
 async fn srp6_register(
@@ -1035,10 +1014,7 @@ async fn get_user_secrets(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
     {
         Ok(Some(data)) => {
             if data.locked == 1
-                || data.danger
-                    > retreive_config("USER-LOCKOUT")
-                        .parse::<u32>()
-                        .unwrap_or(1000)
+                || data.danger > retreive_config::<u32>("user.lockout").unwrap_or(1000)
             {
                 trace!(
                     "Client-{} requesting to login to user {:?}, who has been locked out",
@@ -1074,7 +1050,7 @@ async fn get_user_secrets(username: &[u8], pool: &MySqlPool, id: usize) -> UserS
     }
 }
 
-async fn get_user_token(username: &[u8], pool: &MySqlPool, client: &str) -> Option<Vec<u8>> {
+async fn get_user_token(username: &[u8], pool: &MySqlPool) -> Option<Vec<u8>> {
     let (userid, salt, verifier, magic) = match sqlx::query!(
         "SELECT userid, salt, verifier, magic FROM users WHERE username = ?",
         username
@@ -1085,52 +1061,16 @@ async fn get_user_token(username: &[u8], pool: &MySqlPool, client: &str) -> Opti
         Ok(Some(data)) => (data.userid, data.salt, data.verifier, data.magic),
         _ => return None,
     };
-    let mut user = Vec::new();
-    user.extend_from_slice(username);
-    user.extend_from_slice(client.as_bytes());
-    user.extend_from_slice(&userid);
-    let mut hash1 = Sha3_512::new();
-    let mut hash2 = Sha3_512::new();
-    let mut hash3 = Sha3_512::new();
-    let mut hash4 = Sha3_512::new();
-    hash1.update(&salt);
-    hash2.update(&verifier);
-    hash3.update(&user);
-    hash4.update(magic.unwrap_or_default());
-    let keys = [
-        &hash1.finalize(),
-        &hash2.finalize(),
-        &hash3.finalize(),
-        &hash4.finalize(),
-    ];
-    let mut newkeys = [
-        vec![u8::default()],
-        vec![u8::default()],
-        vec![u8::default()],
-        vec![u8::default()],
-    ];
-    for key in keys {
-        for i in 0..key.len() / 4 {
-            newkeys[0].push(key[i * 4]);
-            newkeys[1].push(key[i * 4 + 1]);
-            newkeys[2].push(key[i * 4 + 2]);
-            newkeys[3].push(key[i * 4 + 3]);
-        }
-    }
-    let mut hash1 = Sha3_512::new();
-    let mut hash2 = Sha3_512::new();
-    let mut hash3 = Sha3_512::new();
-    let mut hash4 = Sha3_512::new();
-    let mut data = Vec::new();
-    hash1.update(&newkeys[0]);
-    hash2.update(&newkeys[1]);
-    hash3.update(&newkeys[2]);
-    hash4.update(&newkeys[3]);
-    data.extend_from_slice(&hash1.finalize());
-    data.extend_from_slice(&hash2.finalize());
-    data.extend_from_slice(&hash3.finalize());
-    data.extend_from_slice(&hash4.finalize());
-    Some(data)
+    let mut cleartext = Vec::new();
+    cleartext.extend_from_slice(username);
+    cleartext.extend_from_slice(&userid);
+    cleartext.extend_from_slice(&salt);
+    cleartext.extend_from_slice(&verifier);
+    cleartext.extend_from_slice(&magic.unwrap_or_default());
+    let mut hash = Sha3_512::new();
+    hash.update(&cleartext);
+    let token = hash.finalize();
+    Some(token.to_vec())
 }
 
 async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option<u32> {
@@ -1255,6 +1195,17 @@ async fn client_penalise(client: &str, pool: &MySqlPool, amount: i32) -> Option<
                     None
                 }
             }
+        }
+    }
+}
+
+fn retreive_config<'x, T: serde::de::Deserialize<'x>>(fig: &str) -> Option<T> {
+    let figment = Figment::new().merge(Yaml::file("config.yml"));
+    match figment.extract_inner(fig) {
+        Ok(data) => Some(data),
+        Err(e) => {
+            debug!("Failed to query config yaml. {}", e);
+            None
         }
     }
 }
