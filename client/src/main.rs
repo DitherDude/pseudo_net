@@ -44,8 +44,8 @@ fn main() {
     if token.is_empty() {
         new_session(&stream);
     } else {
-        let unlockkey = &token[..256];
-        let username = &token[256..];
+        let unlockkey = &token[..64];
+        let username = &token[64..];
         resume_session(&stream, Some(username), unlockkey);
     }
 }

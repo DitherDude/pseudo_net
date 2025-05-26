@@ -1,5 +1,5 @@
 /target
 Cargo.lock
-config
+config.yml
 /.sqlx
 token
