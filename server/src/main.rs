@@ -749,7 +749,18 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             send_data(&data, &stream);
             trace!("Awaiting proof from Client-{}...", id);
             let response = receive_data(&stream);
-            let ciphertext = block_decrypt(&private_key, &response).unwrap();
+            let ciphertext = match block_decrypt(&private_key, &response).unwrap() {
+                Ok(data) => data,
+                Err(e) => {
+                    debug!(
+                        "Client-{} sent invalid bytes. Sending errorcode and dropping connection. {}",
+                        id, e
+                    );
+                    send_data(&400_i32.to_le_bytes(), &stream);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            };
             let data = match cipher.decrypt(&decryptnonce.into(), &ciphertext[..]) {
                 Ok(data) => {
                     if data.len() <= 24 {
@@ -796,8 +807,8 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     verified = false;
                     let mut fluff = [0u8; 32];
                     let mut fluff2 = [0u8; 32];
-                    let _ = rng.try_fill_bytes(&mut fluff);
-                    let _ = rng.try_fill_bytes(&mut fluff2);
+                    rng.try_fill_bytes(&mut fluff).unwrap();
+                    rng.try_fill_bytes(&mut fluff2).unwrap();
                     if user_penalise(
                         username,
                         &pool,
