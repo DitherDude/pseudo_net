@@ -11,7 +11,7 @@ use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey, rand_core::RngCor
 use sha3::{Digest, Sha3_256, Sha3_512};
 use sqlx::mysql::MySqlPool;
 use srp6::prelude::*;
-use std::cmp::Ordering::{Equal, Greater, Less};
+use std::cmp::Ordering;
 use std::net::{TcpListener, TcpStream};
 use std::process::exit;
 use tracing::{Level, debug, error, info, trace, warn};
@@ -110,7 +110,7 @@ async fn main() {
                         }
                     }
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(e) => {
                     error!("Failed to check users table schema: {}", e);
                     exit(1);
@@ -165,7 +165,7 @@ async fn main() {
                         }
                     }
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(e) => {
                     error!("Failed to check clients table schema: {}", e);
                     exit(1);
@@ -386,7 +386,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             .await
             {
                 Ok(Some(data)) => data.count,
-                Ok(None) => {
+                Ok(_) => {
                     debug!(
                         "Unexpected response from database. Sending errorocode and dropping Client-{}.",
                         id
@@ -451,7 +451,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                     }
                 };
                 match payload.len().cmp(&1048) {
-                    Less => {
+                    Ordering::Less => {
                         debug!(
                             "Data is too short (expecting 1048b). Sending errorcode and dropping Client-{}.",
                             id
@@ -460,7 +460,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
                     }
-                    Greater => {
+                    Ordering::Greater => {
                         debug!(
                             "Data is too long (expecting 1048b). Sending errorcode and dropping Client-{}.",
                             id
@@ -469,7 +469,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
                     }
-                    Equal => {
+                    Ordering::Equal => {
                         let encryptnonce = &payload[..24];
                         let salt = &payload[24..536];
                         let verifier = &payload[536..1048];
@@ -480,7 +480,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                             plaintext.extend_from_slice(&decryptnonce);
                             plaintext.extend_from_slice(&match token {
                             Some(data) => data,
-                            None => {
+                            _ => {
                                 debug!(
                                     "Failed to generate token. Sending errorcode and dropping Client-{}.",
                                     id
@@ -554,7 +554,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             .await
             {
                 Ok(Some(data)) => data.count,
-                Ok(None) => {
+                Ok(_) => {
                     debug!(
                         "Unexpected response from database. Sending errorocode and dropping Client-{}.",
                         id
@@ -705,7 +705,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
             .await
             {
                 Ok(Some(data)) => data.count,
-                Ok(None) => {
+                Ok(_) => {
                     debug!(
                         "Unexpected response from database. Sending errorocode and dropping Client-{}.",
                         id
@@ -848,7 +848,7 @@ async fn handle_connection(stream: TcpStream, id: usize) {
                                 rng.try_fill_bytes(&mut fluff).unwrap();
                                 fluff.to_vec()
                             }),
-                            None => {
+                            _ => {
                                 debug!("Database error!");
                                 let mut fluff = [0u8; 24];
                                 rng.try_fill_bytes(&mut fluff).unwrap();
@@ -1080,7 +1080,7 @@ async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option
     {
         Ok(data) => match data {
             Some(data) => data.danger,
-            None => {
+            _ => {
                 debug!("Database error!");
                 return None;
             }
@@ -1091,8 +1091,8 @@ async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option
         }
     };
     match amount.cmp(&0) {
-        Equal => Some(0),
-        Greater => {
+        Ordering::Equal => Some(0),
+        Ordering::Greater => {
             let new = current.saturating_add(amount as u32);
             match sqlx::query!(
                 "UPDATE users SET danger = ? WHERE username = ?",
@@ -1109,7 +1109,7 @@ async fn user_penalise(username: &[u8], pool: &MySqlPool, amount: i32) -> Option
                 }
             }
         }
-        Less => {
+        Ordering::Less => {
             let new = current.saturating_sub(amount.unsigned_abs());
             match sqlx::query!(
                 "UPDATE users SET danger = ? WHERE username = ?",
@@ -1136,7 +1136,7 @@ async fn client_penalise(client: &str, pool: &MySqlPool, amount: i32) -> Option<
     {
         Ok(data) => match data {
             Some(data) => data.penalty,
-            None => {
+            _ => {
                 match sqlx::query!(
                     r#"
                     INSERT INTO clients (client)
@@ -1161,8 +1161,8 @@ async fn client_penalise(client: &str, pool: &MySqlPool, amount: i32) -> Option<
         }
     };
     match amount.cmp(&0) {
-        Equal => Some(0),
-        Greater => {
+        Ordering::Equal => Some(0),
+        Ordering::Greater => {
             let new = current.saturating_add(amount as u32);
             match sqlx::query!(
                 "UPDATE clients SET penalty = ? WHERE client = ?",
@@ -1179,7 +1179,7 @@ async fn client_penalise(client: &str, pool: &MySqlPool, amount: i32) -> Option<
                 }
             }
         }
-        Less => {
+        Ordering::Less => {
             let new = current.saturating_sub(amount.unsigned_abs());
             match sqlx::query!(
                 "UPDATE clients SET penalty = ? WHERE client = ?",

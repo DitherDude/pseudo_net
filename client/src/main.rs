@@ -164,7 +164,7 @@ fn resume_session(stream: &TcpStream, usernameraw: Option<&[u8]>, unlockkey: &[u
     debug!("Resume session requested.");
     let username = match usernameraw {
         Some(username) => username.to_vec(),
-        None => {
+        _ => {
             trace!("Requesting username...");
             request("Username: ", false).into_bytes()
         }
@@ -223,7 +223,7 @@ fn login(stream: &TcpStream, usernameraw: Option<&[u8]>) -> (Vec<u8>, Vec<u8>, V
     debug!("Login session requested.");
     let username = match usernameraw {
         Some(username) => username.to_vec(),
-        None => {
+        _ => {
             trace!("Requesting username...");
             request("Username: ", false).into_bytes()
         }
@@ -315,8 +315,7 @@ fn request(prompt: &str, password: bool) -> String {
         std::io::stdout().flush().unwrap();
     }
     println!("\x1B[2K\r\x1B[32m{}\x1B[0m", prompt);
-    let password = password.trim().to_string();
-    password
+    password.trim().to_string()
 }
 
 fn choice(prompt: &str, yes: &str, no: &str) -> bool {
