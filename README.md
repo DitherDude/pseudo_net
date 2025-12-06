@@ -1,3 +1,7 @@
+# This repo has moved!
+This repository has been moved to https://git.dither.au/DitherDude/pseudo_net.
+
+
 # Quick start guide:
 In the root folder of this program, create a file called `config.yml`.
 > [!IMPORTANT]
