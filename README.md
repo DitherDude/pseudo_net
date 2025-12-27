@@ -1,5 +1,5 @@
 # This repo has moved!
-This repository has been moved to https://git.dither.au/DitherDude/pseudo_net.
+This repository has been moved to https://git.ditherdude.dev/DitherDude/pseudo_net.
 
 
 # Quick start guide:
